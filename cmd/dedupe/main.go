@@ -6,6 +6,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -48,8 +49,8 @@ func usage() {
 
 Usage:
   dedupe scan [flags] <directory>     scan a directory, write a plan (dry-run; no files touched)
-  dedupe apply <plan-file>            move losers from a plan into .dedupe-quarantine/
-  dedupe restore <plan-file>          move quarantined losers back to their original paths
+  dedupe apply <plan-file>            sort a plan's winners into dedupe-kept/ and losers into dedupe-quarantine/
+  dedupe restore <plan-file>          move kept and quarantined files back to their original paths
 
 Run 'dedupe scan -h' for scan flags.`)
 }
@@ -60,6 +61,7 @@ func runScan(args []string) error {
 	similarity := fs.Int("similarity", 8, "max perceptual-hash Hamming distance to treat two images as the same shot (needs tuning against your own photos)")
 	blur := fs.Float64("blur", 5e6, "sharpness margin below a group's best before a candidate is excluded from winning (needs tuning against your own photos)")
 	out := fs.String("out", "", "plan output path (default: <directory>/.dedupe-plan.json)")
+	logPath := fs.String("log", "", "also write progress logs to this file (progress always prints to the terminal)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -76,11 +78,24 @@ func runScan(args []string) error {
 		outPath = filepath.Join(root, ".dedupe-plan.json")
 	}
 
+	progressOut := io.Writer(os.Stderr)
+	if *logPath != "" {
+		logFile, err := os.Create(*logPath)
+		if err != nil {
+			return fmt.Errorf("creating log file: %w", err)
+		}
+		defer logFile.Close()
+		progressOut = io.MultiWriter(os.Stderr, logFile)
+	}
+
 	p, warnings, err := scan.Run(scan.Options{
 		Root:                 root,
 		GapThreshold:         *gap,
 		SimilarityThreshold:  *similarity,
 		BlurThreshold:        *blur,
+		Progress: func(index, total int, path string) {
+			fmt.Fprintf(progressOut, "[%d/%d] %s\n", index, total, path)
+		},
 	})
 	if err != nil {
 		return err
@@ -133,7 +148,8 @@ func runApply(args []string) error {
 		return err
 	}
 	printResults("apply", results)
-	fmt.Printf("\nquarantine folder: %s\n", filepath.Join(p.Root, apply.QuarantineDirName))
+	fmt.Printf("\nkept folder:        %s\n", filepath.Join(p.Root, apply.KeptDirName))
+	fmt.Printf("quarantine folder:  %s (review, then delete it yourself)\n", filepath.Join(p.Root, apply.QuarantineDirName))
 	fmt.Println("to undo, run: dedupe restore", args[0])
 	return nil
 }
@@ -165,13 +181,19 @@ func readPlan(path string) (plan.Plan, error) {
 }
 
 func printResults(action string, results []apply.Result) {
+	var movedWinners, movedLosers int
 	counts := map[apply.Outcome]int{}
 	for _, r := range results {
 		counts[r.Outcome]++
-		if r.Outcome != apply.OutcomeMoved {
-			fmt.Printf("  skipped (%s): %s\n", r.Outcome, r.Path)
+		switch {
+		case r.Outcome == apply.OutcomeMoved && r.Role == apply.RoleWinner:
+			movedWinners++
+		case r.Outcome == apply.OutcomeMoved && r.Role == apply.RoleLoser:
+			movedLosers++
+		case r.Outcome != apply.OutcomeMoved:
+			fmt.Printf("  skipped (%s, %s): %s\n", r.Outcome, r.Role, r.Path)
 		}
 	}
-	fmt.Printf("%s complete: %d moved, %d skipped (drift), %d skipped (missing)\n",
-		action, counts[apply.OutcomeMoved], counts[apply.OutcomeSkippedDrift], counts[apply.OutcomeSkippedMissing])
+	fmt.Printf("%s complete: %d winners moved, %d losers moved, %d skipped (drift), %d skipped (missing)\n",
+		action, movedWinners, movedLosers, counts[apply.OutcomeSkippedDrift], counts[apply.OutcomeSkippedMissing])
 }

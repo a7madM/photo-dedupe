@@ -1,8 +1,9 @@
 # photo-dedupe
 
-Finds near-duplicate photos in a local directory (e.g. burst shots), keeps the
-best one per group, and moves the rest to a quarantine folder — fully local,
-no network calls.
+Finds near-duplicate photos in a local directory (e.g. burst shots), and on
+`apply` sorts each group's best image into a kept folder and the rest into a
+quarantine folder for you to review and delete yourself — fully local, no
+network calls.
 
 ## How it works
 
@@ -27,24 +28,78 @@ logged like any other unreadable file.
 ## Usage
 
 ```
-dedupe scan [-gap 60s] [-similarity 8] [-blur 5e6] [-out path] <directory>
+dedupe scan [-gap 60s] [-similarity 8] [-blur 5e6] [-out path] [-log path] <directory>
 dedupe apply <plan-file>
 dedupe restore <plan-file>
 ```
 
+`scan` flags:
+
+| Flag          | Default                          | Meaning                                                                                     |
+|---------------|-----------------------------------|-----------------------------------------------------------------------------------------------|
+| `-gap`        | `60s`                             | Max gap between consecutive shots to stay in the same time-cluster.                          |
+| `-similarity` | `8`                               | Max perceptual-hash Hamming distance to treat two images as the same shot.                   |
+| `-blur`       | `5e6`                             | Sharpness margin below a group's best before a candidate is excluded from winning.            |
+| `-out`        | `<directory>/.dedupe-plan.json`   | Where to write the plan file.                                                                 |
+| `-log`        | *(none)*                          | Also mirror progress lines (`[i/total] path`) to this file. Progress always prints to the terminal regardless of this flag. |
+
 `scan` never touches your files — it writes a plan (`.dedupe-plan.json` in the
 scanned directory by default) and prints a summary. Review the plan, then:
 
-`apply` re-verifies each loser's content hash against the plan (catches drift
-since the scan ran) and moves it into `.dedupe-quarantine/` on the same
-volume — never a hard delete. Empty that folder yourself once you trust the
-results.
+`apply` re-verifies every winner's and loser's content hash against the plan
+(catches drift since the scan ran) and relocates them on the same volume —
+winners into `dedupe-kept/`, losers into `dedupe-quarantine/` — preserving
+each file's original relative path under whichever folder it lands in.
+Nothing is ever hard-deleted: `dedupe-quarantine/` is yours to review and
+delete yourself once you trust the results.
 
-`restore` reverses an apply, moving quarantined files back to their original
-paths using the same plan file.
+`restore` reverses an apply, moving both kept and quarantined files back to
+their original paths using the same plan file.
 
-Re-running `scan` on the same directory always skips `.dedupe-quarantine/`,
-so it's safe to run repeatedly.
+`apply` only touches files that ended up in a group — an image with no
+close-enough duplicate is never part of a group, so it's left untouched at
+its original path. `dedupe-kept/` holds group winners only, not your whole
+library; the rest of your files stay exactly where they were.
+
+Re-running `scan` on the same directory always skips `dedupe-kept/` and
+`dedupe-quarantine/`, so it's safe to run repeatedly.
+
+## Testing against a sample
+
+Before pointing `scan` at a whole library, it's worth trying it against a
+small sample first. This copies the 100 most-recently-modified supported
+images (jpg/jpeg/png/heic/heif) from a source directory into a sample
+folder, skipping macOS's `._*` AppleDouble sidecar files:
+
+```
+mkdir -p ~/Documents/test-dedupe
+
+find "<source directory>" -type f \
+  \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' -o -iname '*.heif' \) \
+  ! -name '._*' \
+  -exec stat -f '%m %N' {} \; \
+  | sort -rn \
+  | head -100 \
+  | cut -d' ' -f2- \
+  | while IFS= read -r f; do cp -p "$f" ~/Documents/test-dedupe/; done
+
+ls ~/Documents/test-dedupe | wc -l
+```
+
+How it works:
+
+- `stat -f '%m %N'` prefixes each path with its modification time (epoch
+  seconds).
+- `sort -rn` sorts numerically descending, so the newest files come first.
+- `head -100` takes the top 100.
+- `cut -d' ' -f2-` strips the mtime prefix back off — safe even with spaces
+  in filenames, since it just rejoins everything after the first field.
+- `cp -p` preserves the original mtime on the copies, so `scan`'s
+  time-clustering fallback (EXIF-less files) behaves the same on the sample
+  as it would on the source.
+
+Adjust `head -100` and `~/Documents/test-dedupe` to change the sample size or
+destination. Then run `scan` against the sample folder as usual.
 
 ## Tuning
 

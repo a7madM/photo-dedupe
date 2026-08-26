@@ -1,3 +1,4 @@
 /dedupe
 .dedupe-plan.json
-.dedupe-quarantine/
+dedupe-kept/
+dedupe-quarantine/

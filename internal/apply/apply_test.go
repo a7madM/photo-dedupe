@@ -28,9 +28,22 @@ func hashOf(t *testing.T, path string) string {
 	return h
 }
 
-func TestApply_MovesLoserIntoQuarantine_PreservingRelativePath(t *testing.T) {
+func findResult(t *testing.T, results []Result, path string) Result {
+	t.Helper()
+	for _, r := range results {
+		if r.Path == path {
+			return r
+		}
+	}
+	t.Fatalf("no result for %s in %+v", path, results)
+	return Result{}
+}
+
+func TestApply_MovesWinnerIntoKeptAndLoserIntoQuarantine_PreservingRelativePath(t *testing.T) {
 	root := t.TempDir()
+	winnerPath := filepath.Join(root, "sub", "a.jpg")
 	loserPath := filepath.Join(root, "sub", "b.jpg")
+	writeFile(t, winnerPath, "winner content")
 	writeFile(t, loserPath, "loser content")
 
 	p := plan.Plan{
@@ -38,54 +51,66 @@ func TestApply_MovesLoserIntoQuarantine_PreservingRelativePath(t *testing.T) {
 		Groups: []plan.Group{
 			{
 				ID:     1,
-				Winner: plan.FileRecord{Path: filepath.Join(root, "sub", "a.jpg")},
-				Losers: []plan.FileRecord{
-					{Path: loserPath, ContentHash: hashOf(t, loserPath)},
-				},
+				Winner: plan.FileRecord{Path: winnerPath, ContentHash: hashOf(t, winnerPath)},
+				Losers: []plan.FileRecord{{Path: loserPath, ContentHash: hashOf(t, loserPath)}},
 			},
 		},
 	}
-	writeFile(t, p.Groups[0].Winner.Path, "winner content")
 
 	results, err := Apply(p)
 	if err != nil {
 		t.Fatalf("Apply returned error: %v", err)
 	}
-
-	if len(results) != 1 || results[0].Path != loserPath || results[0].Outcome != OutcomeMoved {
-		t.Fatalf("results = %+v, want one Moved result for %s", results, loserPath)
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2 (one winner, one loser)", results)
 	}
 
+	wr := findResult(t, results, winnerPath)
+	if wr.Outcome != OutcomeMoved || wr.Role != RoleWinner {
+		t.Fatalf("winner result = %+v, want Moved/RoleWinner", wr)
+	}
+	lr := findResult(t, results, loserPath)
+	if lr.Outcome != OutcomeMoved || lr.Role != RoleLoser {
+		t.Fatalf("loser result = %+v, want Moved/RoleLoser", lr)
+	}
+
+	if _, err := os.Stat(winnerPath); !os.IsNotExist(err) {
+		t.Fatalf("winner file still exists at original path: %v", err)
+	}
 	if _, err := os.Stat(loserPath); !os.IsNotExist(err) {
 		t.Fatalf("loser file still exists at original path: %v", err)
 	}
 
+	kept := filepath.Join(root, KeptDirName, "sub", "a.jpg")
+	data, err := os.ReadFile(kept)
+	if err != nil {
+		t.Fatalf("kept file not found at %s: %v", kept, err)
+	}
+	if string(data) != "winner content" {
+		t.Fatalf("kept content = %q, want %q", data, "winner content")
+	}
+
 	quarantined := filepath.Join(root, QuarantineDirName, "sub", "b.jpg")
-	data, err := os.ReadFile(quarantined)
+	data, err = os.ReadFile(quarantined)
 	if err != nil {
 		t.Fatalf("quarantined file not found at %s: %v", quarantined, err)
 	}
 	if string(data) != "loser content" {
 		t.Fatalf("quarantined content = %q, want %q", data, "loser content")
 	}
-
-	if _, err := os.Stat(p.Groups[0].Winner.Path); err != nil {
-		t.Fatalf("winner file should be untouched: %v", err)
-	}
 }
 
-func TestApply_DriftedContent_SkippedAndNotMoved(t *testing.T) {
+func TestApply_WinnerDrifted_SkippedAndNotMoved(t *testing.T) {
 	root := t.TempDir()
-	loserPath := filepath.Join(root, "b.jpg")
-	writeFile(t, loserPath, "original content")
-	staleHash := hashOf(t, loserPath)
-
-	writeFile(t, loserPath, "content changed since scan")
+	winnerPath := filepath.Join(root, "a.jpg")
+	writeFile(t, winnerPath, "original content")
+	staleHash := hashOf(t, winnerPath)
+	writeFile(t, winnerPath, "content changed since scan")
 
 	p := plan.Plan{
 		Root: root,
 		Groups: []plan.Group{
-			{ID: 1, Losers: []plan.FileRecord{{Path: loserPath, ContentHash: staleHash}}},
+			{ID: 1, Winner: plan.FileRecord{Path: winnerPath, ContentHash: staleHash}},
 		},
 	}
 
@@ -93,23 +118,22 @@ func TestApply_DriftedContent_SkippedAndNotMoved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply returned error: %v", err)
 	}
-
-	if len(results) != 1 || results[0].Outcome != OutcomeSkippedDrift {
-		t.Fatalf("results = %+v, want one SkippedDrift result", results)
+	if len(results) != 1 || results[0].Outcome != OutcomeSkippedDrift || results[0].Role != RoleWinner {
+		t.Fatalf("results = %+v, want one SkippedDrift/RoleWinner result", results)
 	}
-	if _, err := os.Stat(loserPath); err != nil {
-		t.Fatalf("drifted file should remain at original path: %v", err)
+	if _, err := os.Stat(winnerPath); err != nil {
+		t.Fatalf("drifted winner should remain at original path: %v", err)
 	}
 }
 
-func TestApply_MissingFile_SkippedWithoutError(t *testing.T) {
+func TestApply_WinnerMissing_SkippedWithoutError(t *testing.T) {
 	root := t.TempDir()
 	missingPath := filepath.Join(root, "gone.jpg")
 
 	p := plan.Plan{
 		Root: root,
 		Groups: []plan.Group{
-			{ID: 1, Losers: []plan.FileRecord{{Path: missingPath, ContentHash: "whatever"}}},
+			{ID: 1, Winner: plan.FileRecord{Path: missingPath, ContentHash: "whatever"}},
 		},
 	}
 
@@ -117,21 +141,92 @@ func TestApply_MissingFile_SkippedWithoutError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply returned error: %v", err)
 	}
-
-	if len(results) != 1 || results[0].Outcome != OutcomeSkippedMissing {
-		t.Fatalf("results = %+v, want one SkippedMissing result", results)
+	if len(results) != 1 || results[0].Outcome != OutcomeSkippedMissing || results[0].Role != RoleWinner {
+		t.Fatalf("results = %+v, want one SkippedMissing/RoleWinner result", results)
 	}
 }
 
-func TestRestore_ReversesApply_FileBackAtOriginalPath(t *testing.T) {
+func TestApply_DriftedLoserContent_SkippedAndNotMoved(t *testing.T) {
 	root := t.TempDir()
+	winnerPath := filepath.Join(root, "a.jpg")
+	loserPath := filepath.Join(root, "b.jpg")
+	writeFile(t, winnerPath, "winner content")
+	writeFile(t, loserPath, "original content")
+	staleHash := hashOf(t, loserPath)
+	writeFile(t, loserPath, "content changed since scan")
+
+	p := plan.Plan{
+		Root: root,
+		Groups: []plan.Group{
+			{
+				ID:     1,
+				Winner: plan.FileRecord{Path: winnerPath, ContentHash: hashOf(t, winnerPath)},
+				Losers: []plan.FileRecord{{Path: loserPath, ContentHash: staleHash}},
+			},
+		},
+	}
+
+	results, err := Apply(p)
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2", results)
+	}
+	lr := findResult(t, results, loserPath)
+	if lr.Outcome != OutcomeSkippedDrift || lr.Role != RoleLoser {
+		t.Fatalf("loser result = %+v, want SkippedDrift/RoleLoser", lr)
+	}
+	if _, err := os.Stat(loserPath); err != nil {
+		t.Fatalf("drifted loser should remain at original path: %v", err)
+	}
+}
+
+func TestApply_MissingLoserFile_SkippedWithoutError(t *testing.T) {
+	root := t.TempDir()
+	winnerPath := filepath.Join(root, "a.jpg")
+	writeFile(t, winnerPath, "winner content")
+	missingPath := filepath.Join(root, "gone.jpg")
+
+	p := plan.Plan{
+		Root: root,
+		Groups: []plan.Group{
+			{
+				ID:     1,
+				Winner: plan.FileRecord{Path: winnerPath, ContentHash: hashOf(t, winnerPath)},
+				Losers: []plan.FileRecord{{Path: missingPath, ContentHash: "whatever"}},
+			},
+		},
+	}
+
+	results, err := Apply(p)
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2", results)
+	}
+	lr := findResult(t, results, missingPath)
+	if lr.Outcome != OutcomeSkippedMissing || lr.Role != RoleLoser {
+		t.Fatalf("loser result = %+v, want SkippedMissing/RoleLoser", lr)
+	}
+}
+
+func TestRestore_ReversesApply_WinnerAndLoserBackAtOriginalPaths(t *testing.T) {
+	root := t.TempDir()
+	winnerPath := filepath.Join(root, "sub", "a.jpg")
 	loserPath := filepath.Join(root, "sub", "b.jpg")
+	writeFile(t, winnerPath, "winner content")
 	writeFile(t, loserPath, "loser content")
 
 	p := plan.Plan{
 		Root: root,
 		Groups: []plan.Group{
-			{ID: 1, Losers: []plan.FileRecord{{Path: loserPath, ContentHash: hashOf(t, loserPath)}}},
+			{
+				ID:     1,
+				Winner: plan.FileRecord{Path: winnerPath, ContentHash: hashOf(t, winnerPath)},
+				Losers: []plan.FileRecord{{Path: loserPath, ContentHash: hashOf(t, loserPath)}},
+			},
 		},
 	}
 
@@ -143,31 +238,48 @@ func TestRestore_ReversesApply_FileBackAtOriginalPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Restore returned error: %v", err)
 	}
-	if len(results) != 1 || results[0].Path != loserPath || results[0].Outcome != OutcomeMoved {
-		t.Fatalf("results = %+v, want one Moved result for %s", results, loserPath)
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2", results)
+	}
+	wr := findResult(t, results, winnerPath)
+	if wr.Outcome != OutcomeMoved || wr.Role != RoleWinner {
+		t.Fatalf("winner result = %+v, want Moved/RoleWinner", wr)
+	}
+	lr := findResult(t, results, loserPath)
+	if lr.Outcome != OutcomeMoved || lr.Role != RoleLoser {
+		t.Fatalf("loser result = %+v, want Moved/RoleLoser", lr)
 	}
 
-	data, err := os.ReadFile(loserPath)
-	if err != nil {
-		t.Fatalf("restored file not found at original path: %v", err)
+	data, err := os.ReadFile(winnerPath)
+	if err != nil || string(data) != "winner content" {
+		t.Fatalf("restored winner content = %q, err %v, want %q", data, err, "winner content")
 	}
-	if string(data) != "loser content" {
-		t.Fatalf("restored content = %q, want %q", data, "loser content")
+	data, err = os.ReadFile(loserPath)
+	if err != nil || string(data) != "loser content" {
+		t.Fatalf("restored loser content = %q, err %v, want %q", data, err, "loser content")
 	}
-	quarantined := filepath.Join(root, QuarantineDirName, "sub", "b.jpg")
-	if _, err := os.Stat(quarantined); !os.IsNotExist(err) {
+
+	if _, err := os.Stat(filepath.Join(root, KeptDirName, "sub", "a.jpg")); !os.IsNotExist(err) {
+		t.Fatalf("kept copy should no longer exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, QuarantineDirName, "sub", "b.jpg")); !os.IsNotExist(err) {
 		t.Fatalf("quarantined copy should no longer exist: %v", err)
 	}
 }
 
-func TestRestore_QuarantinedFileMissing_SkippedWithoutError(t *testing.T) {
+func TestRestore_RelocatedFileMissing_SkippedWithoutError(t *testing.T) {
 	root := t.TempDir()
+	winnerPath := filepath.Join(root, "a.jpg")
 	loserPath := filepath.Join(root, "b.jpg")
 
 	p := plan.Plan{
 		Root: root,
 		Groups: []plan.Group{
-			{ID: 1, Losers: []plan.FileRecord{{Path: loserPath, ContentHash: "whatever"}}},
+			{
+				ID:     1,
+				Winner: plan.FileRecord{Path: winnerPath, ContentHash: "whatever"},
+				Losers: []plan.FileRecord{{Path: loserPath, ContentHash: "whatever"}},
+			},
 		},
 	}
 
@@ -175,7 +287,15 @@ func TestRestore_QuarantinedFileMissing_SkippedWithoutError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Restore returned error: %v", err)
 	}
-	if len(results) != 1 || results[0].Outcome != OutcomeSkippedMissing {
-		t.Fatalf("results = %+v, want one SkippedMissing result", results)
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2", results)
+	}
+	wr := findResult(t, results, winnerPath)
+	if wr.Outcome != OutcomeSkippedMissing || wr.Role != RoleWinner {
+		t.Fatalf("winner result = %+v, want SkippedMissing/RoleWinner", wr)
+	}
+	lr := findResult(t, results, loserPath)
+	if lr.Outcome != OutcomeSkippedMissing || lr.Role != RoleLoser {
+		t.Fatalf("loser result = %+v, want SkippedMissing/RoleLoser", lr)
 	}
 }

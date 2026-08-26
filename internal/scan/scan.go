@@ -37,6 +37,12 @@ type Options struct {
 	// BlurThreshold: a candidate is excluded from winning if its
 	// sharpness score is more than this far below the group's best.
 	BlurThreshold float64
+
+	// Progress, if non-nil, is called once per discovered file right
+	// after that file's timestamp/metrics have been resolved (whether
+	// or not that resolution succeeded). index is 1-based; total is
+	// the number of files discover found. Optional — nil is a no-op.
+	Progress func(index, total int, path string)
 }
 
 // Warning records a file that was skipped rather than causing the
@@ -69,20 +75,28 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 		return plan.Plan{}, nil, err
 	}
 
+	progress := opts.Progress
+	if progress == nil {
+		progress = func(int, int, string) {}
+	}
+
 	var entries []entry
 	var warnings []Warning
-	for _, path := range paths {
+	for i, path := range paths {
 		ts, _, err := exiftime.Resolve(path)
 		if err != nil {
 			warnings = append(warnings, Warning{Path: path, Reason: "cannot resolve timestamp: " + err.Error()})
+			progress(i+1, len(paths), path)
 			continue
 		}
 		m, err := imagemetrics.Compute(path)
 		if err != nil {
 			warnings = append(warnings, Warning{Path: path, Reason: "cannot decode image: " + err.Error()})
+			progress(i+1, len(paths), path)
 			continue
 		}
 		entries = append(entries, entry{path: path, timestamp: ts, metrics: m})
+		progress(i+1, len(paths), path)
 	}
 
 	byPath := make(map[string]entry, len(entries))
@@ -180,8 +194,8 @@ func toFileRecord(c pick.Candidate) (plan.FileRecord, error) {
 }
 
 // discover walks root recursively and returns every supported image
-// file, excluding the quarantine directory so re-scanning the same
-// root after an apply is safe.
+// file, excluding the kept and quarantine directories so re-scanning
+// the same root after an apply is safe.
 func discover(root string) ([]string, error) {
 	var paths []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -189,7 +203,7 @@ func discover(root string) ([]string, error) {
 			return err
 		}
 		if d.IsDir() {
-			if d.Name() == apply.QuarantineDirName {
+			if d.Name() == apply.KeptDirName || d.Name() == apply.QuarantineDirName {
 				return filepath.SkipDir
 			}
 			return nil

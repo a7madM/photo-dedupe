@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/a7madM/photo-dedupe/internal/apply"
 )
 
 // heicFixture builds a synthetic HEIC file at path from img by
@@ -101,6 +103,56 @@ func flat(size int) image.Image {
 		}
 	}
 	return img
+}
+
+func TestRun_ReportsProgressForEachDiscoveredFile(t *testing.T) {
+	root := t.TempDir()
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	writePNG(t, filepath.Join(root, "a.png"), checkerboard(64), base)
+	writePNG(t, filepath.Join(root, "b.png"), flat(64), base.Add(time.Hour))
+
+	type call struct {
+		index, total int
+		path         string
+	}
+	var calls []call
+
+	_, _, err := Run(Options{
+		Root:                 root,
+		GapThreshold:         time.Minute,
+		SimilarityThreshold:  8,
+		BlurThreshold:        1e9,
+		Progress: func(index, total int, path string) {
+			calls = append(calls, call{index, total, path})
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("progress calls = %+v, want 2 calls (one per discovered file)", calls)
+	}
+	for i, c := range calls {
+		if c.index != i+1 {
+			t.Fatalf("calls[%d].index = %d, want %d", i, c.index, i+1)
+		}
+		if c.total != 2 {
+			t.Fatalf("calls[%d].total = %d, want 2", i, c.total)
+		}
+		if c.path == "" {
+			t.Fatalf("calls[%d].path is empty", i)
+		}
+	}
+}
+
+func TestRun_NilProgressIsOptional(t *testing.T) {
+	root := t.TempDir()
+	writePNG(t, filepath.Join(root, "a.png"), checkerboard(64), time.Now())
+
+	if _, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9}); err != nil {
+		t.Fatalf("Run with nil Progress returned error: %v", err)
+	}
 }
 
 func TestRun_GroupsDuplicatesWithinTimeAndSimilarity(t *testing.T) {
@@ -203,7 +255,7 @@ func TestRun_ExcludesQuarantineDirectory(t *testing.T) {
 	root := t.TempDir()
 	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 
-	quarantineDir := filepath.Join(root, ".dedupe-quarantine")
+	quarantineDir := filepath.Join(root, apply.QuarantineDirName)
 	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
 		t.Fatalf("mkdir quarantine: %v", err)
 	}
@@ -215,5 +267,29 @@ func TestRun_ExcludesQuarantineDirectory(t *testing.T) {
 	}
 	if len(p.Groups) != 0 {
 		t.Fatalf("Groups = %+v, want none (only file was in quarantine dir)", p.Groups)
+	}
+}
+
+func TestRun_ExcludesKeptDirectory(t *testing.T) {
+	root := t.TempDir()
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	keptDir := filepath.Join(root, apply.KeptDirName)
+	if err := os.MkdirAll(keptDir, 0o755); err != nil {
+		t.Fatalf("mkdir kept: %v", err)
+	}
+	// Two identical, close-in-time images: if the kept dir weren't
+	// excluded, these would cluster and similarity-group with each
+	// other, producing a Group. A single file wouldn't prove exclusion
+	// either way, since it can never form a group on its own.
+	writePNG(t, filepath.Join(keptDir, "old-winner-1.png"), checkerboard(64), base)
+	writePNG(t, filepath.Join(keptDir, "old-winner-2.png"), checkerboard(64), base.Add(time.Second))
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(p.Groups) != 0 {
+		t.Fatalf("Groups = %+v, want none (only file was in kept dir)", p.Groups)
 	}
 }
