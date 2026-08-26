@@ -7,13 +7,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/a7madM/photo-dedupe/internal/apply"
 	"github.com/a7madM/photo-dedupe/internal/plan"
 	"github.com/a7madM/photo-dedupe/internal/scan"
+	"github.com/a7madM/photo-dedupe/internal/webui"
 )
 
 func main() {
@@ -30,6 +34,8 @@ func main() {
 		err = runApply(os.Args[2:])
 	case "restore":
 		err = runRestore(os.Args[2:])
+	case "serve":
+		err = runServe(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -51,8 +57,9 @@ Usage:
   dedupe scan [flags] <directory>     scan a directory, write a plan (dry-run; no files touched)
   dedupe apply <plan-file>            sort a plan's winners into dedupe-kept/ and losers into dedupe-quarantine/
   dedupe restore <plan-file>          move kept and quarantined files back to their original paths
+  dedupe serve [-addr host:port]      open a browser UI; pick a directory, scan, apply/restore there
 
-Run 'dedupe scan -h' for scan flags.`)
+Run 'dedupe scan -h' or 'dedupe serve -h' for flags.`)
 }
 
 func runScan(args []string) error {
@@ -169,6 +176,32 @@ func runRestore(args []string) error {
 	}
 	printResults("restore", results)
 	return nil
+}
+
+func runServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:8765", "address to bind the local web UI to (loopback only by default)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: dedupe serve [-addr host:port]")
+	}
+
+	url := "http://" + *addr + "/"
+	fmt.Println("open", url)
+	openBrowser(url)
+
+	return http.ListenAndServe(*addr, webui.New())
+}
+
+// openBrowser best-effort opens url in the default browser; failure
+// is silent since the printed URL above is always the fallback.
+func openBrowser(url string) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	_ = exec.Command("open", url).Start()
 }
 
 func readPlan(path string) (plan.Plan, error) {

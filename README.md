@@ -31,6 +31,7 @@ logged like any other unreadable file.
 dedupe scan [-gap 60s] [-similarity 8] [-blur 5e6] [-out path] [-log path] <directory>
 dedupe apply <plan-file>
 dedupe restore <plan-file>
+dedupe serve [-addr 127.0.0.1:8765]
 ```
 
 `scan` flags:
@@ -63,6 +64,18 @@ library; the rest of your files stay exactly where they were.
 
 Re-running `scan` on the same directory always skips `dedupe-kept/` and
 `dedupe-quarantine/`, so it's safe to run repeatedly.
+
+`serve` opens a browser UI instead of using the terminal for `scan`/`apply`/
+`restore`. It starts with no directory selected — a form on the page asks
+for one (plus `-gap`/`-similarity`/`-blur`, prefilled with the same defaults
+as the CLI), runs the scan server-side, and shows the gallery: each group's
+winner and losers side by side (HEIC is converted to JPEG on the fly for
+display, since most browsers other than Safari can't render it natively),
+with Apply/Restore buttons wired to the same logic as the CLI commands. It
+only binds to the loopback address you give it (`127.0.0.1` by default) and
+only ever serves images that are actually part of the currently loaded
+plan — nothing else on disk is reachable through it. Scanning a different
+directory from the form at any time replaces the loaded plan.
 
 ## Testing against a sample
 

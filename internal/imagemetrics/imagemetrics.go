@@ -37,7 +37,7 @@ func Compute(path string) (Metrics, error) {
 		return Metrics{}, err
 	}
 
-	img, err := decode(path)
+	img, err := Decode(path)
 	if err != nil {
 		return Metrics{}, err
 	}
@@ -59,14 +59,14 @@ func Compute(path string) (Metrics, error) {
 
 var heicExt = map[string]bool{".heic": true, ".heif": true}
 
-// decode decodes any image format Go's stdlib understands directly
+// Decode decodes any image format Go's stdlib understands directly
 // (JPEG, PNG); HEIC/HEIF has no Go stdlib or pure-Go decoder, so those
 // are decoded by shelling out to ImageMagick's "magick" binary, which
 // must be on PATH and built with HEIF support for those files to
 // decode. A missing/incapable magick surfaces as a decode error here,
-// which the caller treats like any other corrupt/unreadable file:
-// skipped, logged, never a deletion candidate.
-func decode(path string) (image.Image, error) {
+// which Compute's caller treats like any other corrupt/unreadable
+// file: skipped, logged, never a deletion candidate.
+func Decode(path string) (image.Image, error) {
 	if heicExt[strings.ToLower(filepath.Ext(path))] {
 		return decodeHEIC(path)
 	}
