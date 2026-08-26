@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +145,52 @@ func TestRun_ReportsProgressForEachDiscoveredFile(t *testing.T) {
 		if c.path == "" {
 			t.Fatalf("calls[%d].path is empty", i)
 		}
+	}
+}
+
+func TestRun_ConcurrentResolutionMatchesSequentialResult(t *testing.T) {
+	root := t.TempDir()
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	// Enough files that a worker pool actually fans out across them,
+	// two duplicate pairs plus solitary files so grouping has to get
+	// the right answer regardless of which goroutine finishes first.
+	writePNG(t, filepath.Join(root, "pairA-1.png"), checkerboard(64), base)
+	writePNG(t, filepath.Join(root, "pairA-2.png"), checkerboard(64), base.Add(2*time.Second))
+	writePNG(t, filepath.Join(root, "pairB-1.png"), quadrants(64), base.Add(time.Minute))
+	writePNG(t, filepath.Join(root, "pairB-2.png"), quadrants(64), base.Add(time.Minute+2*time.Second))
+	for i := 0; i < 6; i++ {
+		writePNG(t, filepath.Join(root, "solo"+string(rune('a'+i))+".png"), flat(64), base.Add(time.Duration(i)*time.Hour))
+	}
+
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	var progressCalls int32
+
+	p, warnings, err := Run(Options{
+		Root:                root,
+		GapThreshold:        time.Minute,
+		SimilarityThreshold: 8,
+		BlurThreshold:       1e9,
+		Concurrency:         4,
+		Progress: func(index, total int, path string) {
+			atomic.AddInt32(&progressCalls, 1)
+			mu.Lock()
+			seen[path] = true
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", warnings)
+	}
+	if int(progressCalls) != 10 || len(seen) != 10 {
+		t.Fatalf("progress calls = %d, distinct paths = %d, want 10 each", progressCalls, len(seen))
+	}
+	if len(p.Groups) != 2 {
+		t.Fatalf("Groups = %+v, want exactly 2 groups", p.Groups)
 	}
 }
 

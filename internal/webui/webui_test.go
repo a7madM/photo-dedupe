@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -233,6 +234,128 @@ func TestApply_RejectsGET(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/apply", nil))
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rr.Code)
+	}
+}
+
+func TestIndex_ShowsQuarantineStatsAfterScan(t *testing.T) {
+	root := t.TempDir()
+	writeDuplicatePair(t, root)
+
+	s := New()
+	doScan(t, s, root)
+
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "1</strong> photo") || !strings.Contains(body, "to quarantine") {
+		t.Fatalf("expected quarantine count in index body, got: %s", body)
+	}
+	if !strings.Contains(body, "reclaimed on apply") {
+		t.Fatalf("expected an estimated-savings figure in index body, got: %s", body)
+	}
+}
+
+func TestSelectWinner_PromotesChosenImageAndPersistsPlan(t *testing.T) {
+	root := t.TempDir()
+	writeDuplicatePair(t, root)
+
+	s := New()
+	doScan(t, s, root)
+
+	s.mu.Lock()
+	group := s.p.Groups[0]
+	s.mu.Unlock()
+	if len(group.Losers) != 1 {
+		t.Fatalf("expected exactly 1 loser, got %d", len(group.Losers))
+	}
+	oldWinner := group.Winner.Path
+	newWinner := group.Losers[0].Path
+
+	form := url.Values{"group": {strconv.Itoa(group.ID)}, "path": {newWinner}}
+	req := httptest.NewRequest(http.MethodPost, "/select-winner", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rr.Code)
+	}
+
+	s.mu.Lock()
+	updated := s.p.Groups[0]
+	s.mu.Unlock()
+	if updated.Winner.Path != newWinner {
+		t.Fatalf("winner = %q, want %q", updated.Winner.Path, newWinner)
+	}
+	if len(updated.Losers) != 1 || updated.Losers[0].Path != oldWinner {
+		t.Fatalf("expected old winner %q to become the loser, got %+v", oldWinner, updated.Losers)
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, ".dedupe-plan.json"))
+	if err != nil {
+		t.Fatalf("read plan file: %v", err)
+	}
+	if !strings.Contains(string(data), filepath.Base(newWinner)) {
+		t.Fatalf("expected plan file on disk to reflect the override")
+	}
+}
+
+func TestSelectWinner_JSONRequest_ReturnsJSONInsteadOfRedirect(t *testing.T) {
+	root := t.TempDir()
+	writeDuplicatePair(t, root)
+
+	s := New()
+	doScan(t, s, root)
+
+	s.mu.Lock()
+	group := s.p.Groups[0]
+	s.mu.Unlock()
+	newWinner := group.Losers[0].Path
+
+	form := url.Values{"group": {strconv.Itoa(group.ID)}, "path": {newWinner}}
+	req := httptest.NewRequest(http.MethodPost, "/select-winner", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rr.Code, rr.Body.String())
+	}
+	var resp selectWinnerResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding response: %v, body: %s", err, rr.Body.String())
+	}
+	if resp.Winner != newWinner || resp.Group != group.ID {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+func TestSelectWinner_UnknownGroup_ReturnsNotFound(t *testing.T) {
+	root := t.TempDir()
+	writeDuplicatePair(t, root)
+
+	s := New()
+	doScan(t, s, root)
+
+	form := url.Values{"group": {"9999"}, "path": {"/nonexistent"}}
+	req := httptest.NewRequest(http.MethodPost, "/select-winner", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestSelectWinner_RejectsGET(t *testing.T) {
+	s := New()
+
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/select-winner", nil))
 
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rr.Code)

@@ -7,7 +7,9 @@ package scan
 import (
 	"io/fs"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/a7madM/photo-dedupe/internal/apply"
@@ -41,8 +43,19 @@ type Options struct {
 	// Progress, if non-nil, is called once per discovered file right
 	// after that file's timestamp/metrics have been resolved (whether
 	// or not that resolution succeeded). index is 1-based; total is
-	// the number of files discover found. Optional — nil is a no-op.
+	// the number of files discover found. Files are resolved
+	// concurrently (see Concurrency), so calls arrive in completion
+	// order rather than discovery order — index still counts up from
+	// 1 to total, one call per file, just not against a fixed path.
+	// Optional — nil is a no-op.
 	Progress func(index, total int, path string)
+
+	// Concurrency caps how many files are decoded and hashed at once
+	// — the expensive part of a scan (EXIF read, image decode,
+	// perceptual hash, sharpness), and embarrassingly parallel since
+	// each file is independent. Zero or negative defaults to
+	// runtime.NumCPU().
+	Concurrency int
 }
 
 // Warning records a file that was skipped rather than causing the
@@ -80,24 +93,7 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 		progress = func(int, int, string) {}
 	}
 
-	var entries []entry
-	var warnings []Warning
-	for i, path := range paths {
-		ts, _, err := exiftime.Resolve(path)
-		if err != nil {
-			warnings = append(warnings, Warning{Path: path, Reason: "cannot resolve timestamp: " + err.Error()})
-			progress(i+1, len(paths), path)
-			continue
-		}
-		m, err := imagemetrics.Compute(path)
-		if err != nil {
-			warnings = append(warnings, Warning{Path: path, Reason: "cannot decode image: " + err.Error()})
-			progress(i+1, len(paths), path)
-			continue
-		}
-		entries = append(entries, entry{path: path, timestamp: ts, metrics: m})
-		progress(i+1, len(paths), path)
-	}
+	entries, warnings := resolveEntries(paths, opts.Concurrency, progress)
 
 	byPath := make(map[string]entry, len(entries))
 	items := make([]cluster.Item, 0, len(entries))
@@ -176,6 +172,73 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 		Groups:      groups,
 	}
 	return p, warnings, nil
+}
+
+// resolveEntries resolves every path's timestamp and image metrics
+// concurrently across a bounded worker pool — the slow part of a scan
+// (EXIF parsing, image decode, perceptual hash, sharpness), and
+// independent per file, so this is where multiple cores actually pay
+// off. progress is serialized behind the same lock that collects
+// results, so callers see one call per file with a strictly
+// increasing count, same as a sequential scan — just not necessarily
+// in discovery order.
+func resolveEntries(paths []string, concurrency int, progress func(index, total int, path string)) ([]entry, []Warning) {
+	if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
+	}
+	if concurrency > len(paths) {
+		concurrency = len(paths)
+	}
+
+	var (
+		mu       sync.Mutex
+		entries  []entry
+		warnings []Warning
+		done     int
+	)
+
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				e, warn := resolveOne(path)
+
+				mu.Lock()
+				if warn != nil {
+					warnings = append(warnings, *warn)
+				} else {
+					entries = append(entries, e)
+				}
+				done++
+				progress(done, len(paths), path)
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, path := range paths {
+		jobs <- path
+	}
+	close(jobs)
+	wg.Wait()
+
+	return entries, warnings
+}
+
+// resolveOne resolves a single file's timestamp and image metrics.
+// Exactly one of the return values is populated.
+func resolveOne(path string) (entry, *Warning) {
+	ts, _, err := exiftime.Resolve(path)
+	if err != nil {
+		return entry{}, &Warning{Path: path, Reason: "cannot resolve timestamp: " + err.Error()}
+	}
+	m, err := imagemetrics.Compute(path)
+	if err != nil {
+		return entry{}, &Warning{Path: path, Reason: "cannot decode image: " + err.Error()}
+	}
+	return entry{path: path, timestamp: ts, metrics: m}, nil
 }
 
 func toFileRecord(c pick.Candidate) (plan.FileRecord, error) {

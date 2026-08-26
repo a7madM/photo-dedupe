@@ -77,6 +77,7 @@ func New() *Server {
 	mux.HandleFunc("/scan/progress", s.handleScanProgress)
 	mux.HandleFunc("/browse", s.handleBrowse)
 	mux.HandleFunc("/image", s.handleImage)
+	mux.HandleFunc("/select-winner", s.handleSelectWinner)
 	mux.HandleFunc("/apply", s.handleApply)
 	mux.HandleFunc("/restore", s.handleRestore)
 	s.mux = mux
@@ -123,13 +124,19 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.hasPlan {
 		data.Groups = make([]groupView, len(s.p.Groups))
+		var totalLosers int
+		var totalBytes int64
 		for i, g := range s.p.Groups {
 			losers := make([]imageView, len(g.Losers))
 			for j, l := range g.Losers {
 				losers[j] = toImageView(l)
+				totalBytes += l.SizeBytes
 			}
+			totalLosers += len(g.Losers)
 			data.Groups[i] = groupView{ID: g.ID, Winner: toImageView(g.Winner), Losers: losers}
 		}
+		data.TotalToQuarantine = totalLosers
+		data.EstimatedSaved = formatSize(totalBytes)
 	}
 	s.mu.Unlock()
 
@@ -435,6 +442,125 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, f)
 }
 
+// selectWinnerResponse is served by handleSelectWinner when the caller
+// asks for JSON (the page's own fetch-based "Make keeper" button) so
+// it can patch the affected frames in place instead of reloading.
+type selectWinnerResponse struct {
+	Message string `json:"message"`
+	Group   int    `json:"group"`
+	Winner  string `json:"winner"`
+}
+
+// handleSelectWinner lets a reviewer override the automatically chosen
+// winner of a group: the image named by "path" becomes the winner and
+// the previous winner drops into the loser list in its place. It
+// rewrites the on-disk plan file too, so a later `dedupe apply` run
+// from the CLI against the same plan sees the same override.
+//
+// The page's own JS calls this with an "Accept: application/json"
+// header and gets a small JSON summary back; a plain form POST (no JS)
+// instead gets the classic redirect-with-banner treatment.
+func (s *Server) handleSelectWinner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	wantsJSON := strings.Contains(r.Header.Get("Accept"), "application/json")
+
+	groupID, err := strconv.Atoi(r.FormValue("group"))
+	if err != nil {
+		http.Error(w, "invalid group id", http.StatusBadRequest)
+		return
+	}
+	path := r.FormValue("path")
+
+	s.mu.Lock()
+	if s.scanning {
+		s.mu.Unlock()
+		http.Error(w, "a scan is in progress — wait for it to finish", http.StatusConflict)
+		return
+	}
+	if !s.hasPlan {
+		s.mu.Unlock()
+		http.Error(w, "no plan loaded — scan a directory first", http.StatusBadRequest)
+		return
+	}
+
+	idx := -1
+	for i, g := range s.p.Groups {
+		if g.ID == groupID {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		s.mu.Unlock()
+		http.Error(w, "group not found", http.StatusNotFound)
+		return
+	}
+
+	g := s.p.Groups[idx]
+	if g.Winner.Path == path {
+		s.mu.Unlock()
+		if wantsJSON {
+			writeJSON(w, selectWinnerResponse{Message: "already the keeper", Group: groupID, Winner: path})
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	loserIdx := -1
+	for i, l := range g.Losers {
+		if l.Path == path {
+			loserIdx = i
+			break
+		}
+	}
+	if loserIdx == -1 {
+		s.mu.Unlock()
+		http.Error(w, "image not found in group", http.StatusNotFound)
+		return
+	}
+
+	newWinner := g.Losers[loserIdx]
+	newLosers := make([]plan.FileRecord, 0, len(g.Losers))
+	newLosers = append(newLosers, g.Winner)
+	for i, l := range g.Losers {
+		if i != loserIdx {
+			newLosers = append(newLosers, l)
+		}
+	}
+	s.p.Groups[idx] = plan.Group{ID: g.ID, Winner: newWinner, Losers: newLosers}
+
+	root := s.p.Root
+	p := s.p
+	message := fmt.Sprintf("group #%d: %s is now the keeper", groupID, filepath.Base(newWinner.Path))
+	s.bannerText = message
+	s.bannerError = false
+	s.mu.Unlock()
+
+	if f, err := os.Create(filepath.Join(root, ".dedupe-plan.json")); err == nil {
+		plan.Write(f, p)
+		f.Close()
+	}
+
+	if wantsJSON {
+		writeJSON(w, selectWinnerResponse{Message: message, Group: groupID, Winner: newWinner.Path})
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -516,6 +642,7 @@ func (s *Server) setBanner(text string, isError bool) {
 }
 
 type imageView struct {
+	Path      string
 	Base      string
 	URL       string
 	Width     int
@@ -526,12 +653,29 @@ type imageView struct {
 
 func toImageView(r plan.FileRecord) imageView {
 	return imageView{
+		Path:      r.Path,
 		Base:      filepath.Base(r.Path),
 		URL:       "/image?" + url.Values{"path": {r.Path}}.Encode(),
 		Width:     r.Width,
 		Height:    r.Height,
 		SizeMB:    fmt.Sprintf("%.1f MB", float64(r.SizeBytes)/1e6),
 		Sharpness: r.Sharpness,
+	}
+}
+
+// formatSize renders a byte count the way a reviewer thinks about
+// storage — decimal units to match the per-image SizeMB above, scaled
+// up to whichever unit keeps the number readable.
+func formatSize(bytes int64) string {
+	switch {
+	case bytes >= 1e9:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/1e9)
+	case bytes >= 1e6:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/1e6)
+	case bytes >= 1e3:
+		return fmt.Sprintf("%.0f KB", float64(bytes)/1e3)
+	default:
+		return fmt.Sprintf("%d B", bytes)
 	}
 }
 
@@ -542,16 +686,18 @@ type groupView struct {
 }
 
 type pageData struct {
-	HasPlan     bool
-	Root        string
-	Scanning    bool
-	GapStr      string
-	SimStr      string
-	BlurStr     string
-	BannerText  string
-	BannerError bool
-	Warnings    []scan.Warning
-	Groups      []groupView
+	HasPlan           bool
+	Root              string
+	Scanning          bool
+	GapStr            string
+	SimStr            string
+	BlurStr           string
+	BannerText        string
+	BannerError       bool
+	Warnings          []scan.Warning
+	Groups            []groupView
+	TotalToQuarantine int
+	EstimatedSaved    string
 }
 
 var indexTmpl = template.Must(template.New("index").Parse(indexHTML))
@@ -733,6 +879,8 @@ const indexHTML = `<!doctype html>
     margin-top: 1.25rem;
   }
   .dial { min-width: 9rem; }
+  .dial-label-row { display: flex; align-items: center; gap: .35rem; margin-bottom: .4rem; }
+  .dial-label-row label { margin-bottom: 0; }
   .dial-control { display: flex; align-items: center; gap: .6rem; }
   .dial input[type="range"] {
     flex: 1;
@@ -750,6 +898,85 @@ const indexHTML = `<!doctype html>
     padding: .35rem .5rem;
   }
   .dial input[type="text"]:focus { outline: 2px solid var(--safelight-dim); outline-offset: 1px; }
+
+  .dial-scale {
+    display: flex; justify-content: space-between;
+    margin-top: .35rem;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    font-size: .6rem;
+    color: var(--muted);
+  }
+
+  .hint-wrap { position: relative; display: inline-flex; align-items: center; }
+  .hint-btn {
+    width: 15px; height: 15px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid var(--gold-dim);
+    background: transparent;
+    color: var(--gold);
+    font-family: var(--mono);
+    font-size: .62rem;
+    line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: help;
+  }
+  .hint-btn:hover, .hint-btn:focus-visible { background: var(--gold); color: var(--bg); outline: none; }
+
+  .hint-pop {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%) translateY(4px);
+    width: 230px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: .7rem .8rem;
+    box-shadow: var(--shadow);
+    font-family: var(--serif);
+    font-size: .78rem;
+    line-height: 1.45;
+    color: var(--paper-dim);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity .15s ease, transform .15s ease;
+    z-index: 50;
+  }
+  .hint-pop::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: var(--rule);
+  }
+  .hint-wrap:hover .hint-pop,
+  .hint-wrap:focus-within .hint-pop {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+  }
+  .hint-title {
+    display: block;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    font-size: .68rem;
+    color: var(--gold);
+    margin-bottom: .35rem;
+  }
+  .hint-default {
+    margin-top: .45rem;
+    font-family: var(--mono);
+    font-size: .68rem;
+    color: var(--muted);
+  }
 
   .shutter-btn {
     margin-left: auto;
@@ -867,6 +1094,19 @@ const indexHTML = `<!doctype html>
   }
   .btn-ghost:hover { border-color: var(--gold); color: var(--gold); }
 
+  .stats-row {
+    display: flex; flex-wrap: wrap; gap: 1.5rem;
+    font-family: var(--mono);
+    font-size: .78rem;
+    color: var(--paper-dim);
+    margin-bottom: 1.5rem;
+    padding: .7rem 1.1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+  }
+  .stats-row strong { color: var(--gold); font-weight: 700; }
+
   .warnings { font-family: var(--mono); font-size: .8rem; color: var(--muted); margin-bottom: 1.75rem; }
   .empty { color: var(--muted); font-style: italic; }
 
@@ -935,7 +1175,19 @@ const indexHTML = `<!doctype html>
     object-fit: cover;
   }
 
-  .mark { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  /* A corner badge, not a full-frame overlay — earlier this traced the
+     whole photo (a full-size circle or an edge-to-edge X), which fought
+     with the photo itself right when a reviewer needs to actually look
+     at it to decide. It also fades on hover so a full, unmarked look
+     is one mouseover away. */
+  .mark {
+    position: absolute; top: 6px; right: 6px;
+    width: 32px; height: 32px;
+    pointer-events: none;
+    filter: drop-shadow(0 2px 5px rgba(0,0,0,.5));
+    transition: opacity .18s ease;
+  }
+  .frame-photo:hover .mark { opacity: .12; }
 
   .stamp {
     position: absolute; top: 8px; left: 8px;
@@ -961,6 +1213,23 @@ const indexHTML = `<!doctype html>
     word-break: break-all;
   }
   .exif { color: var(--muted); font-size: .7rem; }
+
+  .promote-form { margin-top: .5rem; }
+  .btn-promote {
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--gold);
+    border-radius: 6px;
+    padding: .32rem .65rem;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    font-size: .64rem;
+    cursor: pointer;
+    transition: border-color .15s ease, color .15s ease, background .15s ease;
+  }
+  .btn-promote:hover { border-color: var(--gold); background: var(--bg-raised); color: var(--paper); }
+  .btn-promote:disabled { opacity: .4; cursor: default; }
 
   .browse-backdrop {
     position: fixed; inset: 0;
@@ -1101,6 +1370,10 @@ const indexHTML = `<!doctype html>
     <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="7" result="noise"/>
     <feDisplacementMap in="SourceGraphic" in2="noise" scale="6"/>
   </filter>
+  <filter id="pencil-wobble-sm" x="-50%" y="-50%" width="200%" height="200%">
+    <feTurbulence type="fractalNoise" baseFrequency="1.6" numOctaves="2" seed="7" result="noise"/>
+    <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.4"/>
+  </filter>
 </svg>
 <div class="grain" aria-hidden="true"></div>
 <div class="filmstrip-edge left" aria-hidden="true"></div>
@@ -1113,7 +1386,7 @@ const indexHTML = `<!doctype html>
     <div class="subtitle">Contact Sheet Review</div>
   </header>
 
-  {{if .BannerText}}<div class="banner{{if .BannerError}} error{{end}}">{{.BannerText}}</div>{{end}}
+  <div id="banner" class="banner{{if .BannerError}} error{{end}}"{{if not .BannerText}} hidden{{end}}>{{.BannerText}}</div>
 
   <form id="scan-form" method="POST" action="/scan"></form>
 
@@ -1131,25 +1404,58 @@ const indexHTML = `<!doctype html>
 
     <div class="dials-row">
       <div class="dial">
-        <label for="gap-text">Gap</label>
+        <div class="dial-label-row">
+          <label for="gap-text">Gap</label>
+          <span class="hint-wrap">
+            <button type="button" class="hint-btn" aria-label="What does Gap do?" aria-describedby="hint-gap-body">?</button>
+            <div class="hint-pop" role="tooltip" id="hint-gap-body">
+              <span class="hint-title">Burst window</span>
+              How close together in time two shots need to be before they're even compared. Photos taken further apart than this are never grouped, no matter how similar they look.
+              <div class="hint-default">Default: 60s</div>
+            </div>
+          </span>
+        </div>
         <div class="dial-control">
           <input type="range" id="gap-range" min="5" max="900" step="5" aria-label="Gap in seconds">
           <input type="text" id="gap-text" name="gap" form="scan-form" value="{{.GapStr}}" size="6">
         </div>
+        <div class="dial-scale"><span>Tighter</span><span>Looser</span></div>
       </div>
       <div class="dial">
-        <label for="similarity-text">Match</label>
+        <div class="dial-label-row">
+          <label for="similarity-text">Match</label>
+          <span class="hint-wrap">
+            <button type="button" class="hint-btn" aria-label="What does Match do?" aria-describedby="hint-match-body">?</button>
+            <div class="hint-pop" role="tooltip" id="hint-match-body">
+              <span class="hint-title">Same-shot threshold</span>
+              How close two photos need to look to count as duplicates (0 means visually identical). Raise it to also catch shots with more variation, like a slightly different angle — too high and unrelated photos start matching each other.
+              <div class="hint-default">Default: 8</div>
+            </div>
+          </span>
+        </div>
         <div class="dial-control">
           <input type="range" id="similarity-range" min="0" max="32" step="1" aria-label="Similarity threshold">
           <input type="text" id="similarity-text" name="similarity" form="scan-form" value="{{.SimStr}}" size="4">
         </div>
+        <div class="dial-scale"><span>Strict</span><span>Loose</span></div>
       </div>
       <div class="dial">
-        <label for="blur-text">Blur</label>
+        <div class="dial-label-row">
+          <label for="blur-text">Blur</label>
+          <span class="hint-wrap">
+            <button type="button" class="hint-btn" aria-label="What does Blur do?" aria-describedby="hint-blur-body">?</button>
+            <div class="hint-pop" role="tooltip" id="hint-blur-body">
+              <span class="hint-title">Sharpness cutoff</span>
+              The sharpest photo in a group usually wins, but a much higher-resolution shot can still win if it isn't blurrier than this much. Raise it to let bigger-but-softer photos win more often; lower it to always favor the sharpest frame.
+              <div class="hint-default">Default: 5,000,000</div>
+            </div>
+          </span>
+        </div>
         <div class="dial-control">
           <input type="range" id="blur-range" min="0" max="20000000" step="100000" aria-label="Blur threshold">
           <input type="text" id="blur-text" name="blur" form="scan-form" value="{{.BlurStr}}" size="8">
         </div>
+        <div class="dial-scale"><span>Strict</span><span>Forgiving</span></div>
       </div>
       <button type="submit" form="scan-form" class="shutter-btn" aria-label="Run scan"{{if .Scanning}} disabled{{end}}>SCAN</button>
     </div>
@@ -1177,6 +1483,14 @@ const indexHTML = `<!doctype html>
     </form>
   </div>
 
+  {{if .Groups}}
+  <div class="stats-row">
+    <span class="stat"><strong>{{len .Groups}}</strong> group{{if ne (len .Groups) 1}}s{{end}}</span>
+    <span class="stat"><strong>{{.TotalToQuarantine}}</strong> photo{{if ne .TotalToQuarantine 1}}s{{end}} to quarantine</span>
+    <span class="stat">~<strong>{{.EstimatedSaved}}</strong> reclaimed on apply</span>
+  </div>
+  {{end}}
+
   {{if .Warnings}}
   <div class="warnings">{{len .Warnings}} spoiled frame(s) skipped &mdash; never a deletion candidate &mdash; see the terminal log for details.</div>
   {{end}}
@@ -1186,32 +1500,40 @@ const indexHTML = `<!doctype html>
   {{end}}
 
   {{range $i, $g := .Groups}}
-  <article class="group" style="--i: {{$i}}">
+  <article class="group" data-group-id="{{$g.ID}}" style="--i: {{$i}}">
     <div class="group-head">
       <span class="roll-no">Group #{{$g.ID}}</span>
       <span class="frame-count">1 keeper &middot; {{len $g.Losers}} reject{{if ne (len $g.Losers) 1}}s{{end}}</span>
     </div>
     <div class="sprockets"></div>
     <div class="filmstrip">
-      <div class="frame">
+      <div class="frame" data-path="{{$g.Winner.Path}}">
         <div class="frame-photo">
           <img src="{{$g.Winner.URL}}" alt="{{$g.Winner.Base}}" loading="lazy">
-          <svg class="mark" viewBox="0 0 120 120" aria-hidden="true"><ellipse cx="60" cy="60" rx="52" ry="40" fill="none" stroke="#e2481f" stroke-width="5" filter="url(#pencil-wobble)"/></svg>
+          <svg class="mark" viewBox="0 0 34 34" aria-hidden="true">
+            <circle cx="17" cy="17" r="15" fill="#e2481f"/>
+            <path d="M10 17.5 L15 22.5 L24 11.5" fill="none" stroke="#f0e6d6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" filter="url(#pencil-wobble-sm)"/>
+          </svg>
           <span class="stamp">Select</span>
         </div>
         <div class="frame-caption">{{$g.Winner.Base}}<br><span class="exif">{{$g.Winner.Width}}&times;{{$g.Winner.Height}} &middot; {{$g.Winner.SizeMB}} &middot; sharp {{printf "%.0f" $g.Winner.Sharpness}}</span></div>
       </div>
       {{range $g.Losers}}
-      <div class="frame">
+      <div class="frame" data-path="{{.Path}}">
         <div class="frame-photo">
           <img src="{{.URL}}" alt="{{.Base}}" loading="lazy">
-          <svg class="mark" viewBox="0 0 120 120" aria-hidden="true">
-            <line x1="18" y1="18" x2="102" y2="102" stroke="#e2481f" stroke-width="6" filter="url(#pencil-wobble)"/>
-            <line x1="102" y1="18" x2="18" y2="102" stroke="#e2481f" stroke-width="6" filter="url(#pencil-wobble)"/>
+          <svg class="mark" viewBox="0 0 34 34" aria-hidden="true">
+            <circle cx="17" cy="17" r="15" fill="none" stroke="#8a7c6a" stroke-width="2"/>
+            <path d="M12 12 L22 22 M22 12 L12 22" stroke="#8a7c6a" stroke-width="2.5" stroke-linecap="round" filter="url(#pencil-wobble-sm)"/>
           </svg>
           <span class="stamp">Reject</span>
         </div>
         <div class="frame-caption">{{.Base}}<br><span class="exif">{{.Width}}&times;{{.Height}} &middot; {{.SizeMB}} &middot; sharp {{printf "%.0f" .Sharpness}}</span></div>
+        <form method="POST" action="/select-winner" class="promote-form">
+          <input type="hidden" name="group" value="{{$g.ID}}">
+          <input type="hidden" name="path" value="{{.Path}}">
+          <button type="submit" class="btn-promote"{{if $.Scanning}} disabled{{end}}>Make keeper</button>
+        </form>
       </div>
       {{end}}
     </div>
@@ -1441,6 +1763,93 @@ const indexHTML = `<!doctype html>
   if (INITIAL_SCANNING) {
     pollScanProgress();
   }
+
+  // "Make keeper" is submitted via fetch so promoting a loser only
+  // patches the two affected frames in place — a full page reload
+  // would re-fetch every already-loaded photo and drop scroll
+  // position, which is exactly the review flow this button is for.
+  var banner = document.getElementById('banner');
+  function showBanner(text, isError) {
+    banner.textContent = text;
+    banner.classList.toggle('error', !!isError);
+    banner.hidden = false;
+  }
+
+  var WINNER_MARK_SVG = '<svg class="mark" viewBox="0 0 34 34" aria-hidden="true">' +
+    '<circle cx="17" cy="17" r="15" fill="#e2481f"/>' +
+    '<path d="M10 17.5 L15 22.5 L24 11.5" fill="none" stroke="#f0e6d6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" filter="url(#pencil-wobble-sm)"/>' +
+    '</svg>';
+  var LOSER_MARK_SVG = '<svg class="mark" viewBox="0 0 34 34" aria-hidden="true">' +
+    '<circle cx="17" cy="17" r="15" fill="none" stroke="#8a7c6a" stroke-width="2"/>' +
+    '<path d="M12 12 L22 22 M22 12 L12 22" stroke="#8a7c6a" stroke-width="2.5" stroke-linecap="round" filter="url(#pencil-wobble-sm)"/>' +
+    '</svg>';
+
+  function setFrameRole(frameEl, groupId, isWinner) {
+    var photo = frameEl.querySelector('.frame-photo');
+    photo.querySelector('.mark').outerHTML = isWinner ? WINNER_MARK_SVG : LOSER_MARK_SVG;
+    photo.querySelector('.stamp').textContent = isWinner ? 'Select' : 'Reject';
+
+    var existingForm = frameEl.querySelector('.promote-form');
+    if (isWinner) {
+      if (existingForm) existingForm.remove();
+    } else if (!existingForm) {
+      var form = document.createElement('form');
+      form.method = 'POST';
+      form.action = '/select-winner';
+      form.className = 'promote-form';
+      form.innerHTML =
+        '<input type="hidden" name="group" value="' + groupId + '">' +
+        '<input type="hidden" name="path" value="' + escapeHTML(frameEl.dataset.path) + '">' +
+        '<button type="submit" class="btn-promote">Make keeper</button>';
+      frameEl.appendChild(form);
+      bindPromoteForm(form);
+    }
+  }
+
+  function promote(clickedFrame) {
+    var filmstrip = clickedFrame.parentElement;
+    var groupId = filmstrip.closest('.group').dataset.groupId;
+    var winnerFrame = filmstrip.querySelector('.frame');
+    if (winnerFrame === clickedFrame) return;
+
+    setFrameRole(winnerFrame, groupId, false);
+    setFrameRole(clickedFrame, groupId, true);
+    filmstrip.insertBefore(clickedFrame, filmstrip.firstChild);
+  }
+
+  function bindPromoteForm(form) {
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var btn = form.querySelector('.btn-promote');
+      if (btn.disabled) return;
+      btn.disabled = true;
+
+      var body = new URLSearchParams();
+      body.set('group', form.querySelector('input[name="group"]').value);
+      body.set('path', form.querySelector('input[name="path"]').value);
+      var clickedFrame = form.closest('.frame');
+
+      fetch('/select-winner', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        body: body.toString()
+      })
+        .then(function (res) {
+          if (!res.ok) return res.text().then(function (t) { throw new Error(t || res.statusText); });
+          return res.json();
+        })
+        .then(function (json) {
+          promote(clickedFrame);
+          showBanner(json.message, false);
+        })
+        .catch(function (err) {
+          btn.disabled = false;
+          showBanner(err.message || 'Could not set the new keeper.', true);
+        });
+    });
+  }
+
+  document.querySelectorAll('.promote-form').forEach(bindPromoteForm);
 })();
 </script>
 </body>

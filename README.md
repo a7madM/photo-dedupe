@@ -17,6 +17,11 @@ network calls.
    candidate more than `-blur` below the group's best is excluded from
    winning), then highest resolution, then largest file size as a tiebreak.
 
+Resolving each file (EXIF read, image decode, perceptual hash, sharpness)
+runs concurrently across your CPU cores, since every file is independent of
+every other — clustering and grouping still happen afterward, once every
+file's resolved, so the result is the same regardless of how many cores ran.
+
 Supports JPEG, PNG, and HEIC/HEIF (RAW and Apple Photos library integration are
 not in scope yet). HEIC decoding shells out to the system's `magick`
 (ImageMagick) binary — Go has no stdlib or pure-Go HEIC decoder — so `magick`
