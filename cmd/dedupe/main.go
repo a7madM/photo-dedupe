@@ -64,7 +64,7 @@ Run 'dedupe scan -h' or 'dedupe serve -h' for flags.`)
 
 func runScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
-	gap := fs.Duration("gap", 60*time.Second, "max gap between consecutive shots to stay in the same time-cluster")
+	gap := fs.Duration("gap", 20*time.Second, "max gap between consecutive shots to stay in the same time-cluster")
 	similarity := fs.Int("similarity", 8, "max perceptual-hash Hamming distance to treat two images as the same shot (needs tuning against your own photos)")
 	blur := fs.Float64("blur", 5e6, "sharpness margin below a group's best before a candidate is excluded from winning (needs tuning against your own photos)")
 	out := fs.String("out", "", "plan output path (default: <directory>/.dedupe-plan.json)")

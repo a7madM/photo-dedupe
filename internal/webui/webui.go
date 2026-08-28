@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	defaultGap        = "60s"
+	defaultGap        = "20s"
 	defaultSimilarity = "8"
 	defaultBlur       = "5e6"
 )
@@ -1514,7 +1514,7 @@ const indexHTML = `<!doctype html>
             <div class="hint-pop" role="tooltip" id="hint-gap-body">
               <span class="hint-title">Burst window</span>
               How close together in time two shots need to be before they're even compared. Photos taken further apart than this are never grouped, no matter how similar they look.
-              <div class="hint-default">Default: 60s</div>
+              <div class="hint-default">Default: 20s</div>
             </div>
           </span>
         </div>

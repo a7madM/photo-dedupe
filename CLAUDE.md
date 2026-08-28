@@ -22,7 +22,7 @@ go vet ./...
 Running the tool itself:
 
 ```
-./dedupe scan [-gap 60s] [-similarity 8] [-blur 5e6] [-out path] [-log path] <directory>
+./dedupe scan [-gap 20s] [-similarity 8] [-blur 5e6] [-out path] [-log path] <directory>
 ./dedupe apply <plan-file>
 ./dedupe restore <plan-file>
 ./dedupe serve [-addr 127.0.0.1:8765]

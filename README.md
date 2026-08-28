@@ -14,7 +14,7 @@ deleting anything.
 
 ## How it decides
 
-1. **Time-cluster — `gap ≤ 60s`.** Photos are sorted by capture time (EXIF
+1. **Time-cluster — `gap ≤ 20s`.** Photos are sorted by capture time (EXIF
    `DateTimeOriginal`, falling back to file mtime) and split wherever the
    gap between consecutive shots exceeds `-gap`. This only builds a
    *candidate pool* — being close in time never counts as duplicate on its
@@ -50,7 +50,7 @@ just skipped and logged like any other unreadable file.
 ## Usage
 
 ```
-dedupe scan [-gap 60s] [-similarity 8] [-blur 5e6] [-out path] [-log path] <directory>
+dedupe scan [-gap 20s] [-similarity 8] [-blur 5e6] [-out path] [-log path] <directory>
 dedupe apply <plan-file>
 dedupe restore <plan-file>
 dedupe serve [-addr 127.0.0.1:8765]
@@ -60,7 +60,7 @@ dedupe serve [-addr 127.0.0.1:8765]
 
 | Flag          | Default                          | Meaning                                                                                     |
 |---------------|-----------------------------------|-----------------------------------------------------------------------------------------------|
-| `-gap`        | `60s`                             | Max gap between consecutive shots to stay in the same time-cluster.                          |
+| `-gap`        | `20s`                             | Max gap between consecutive shots to stay in the same time-cluster.                          |
 | `-similarity` | `8`                               | Max perceptual-hash Hamming distance to treat two images as the same shot.                   |
 | `-blur`       | `5e6`                             | Sharpness margin below a group's best before a candidate is excluded from winning.            |
 | `-out`        | `<directory>/.dedupe-plan.json`   | Where to write the plan file.                                                                 |
