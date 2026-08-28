@@ -197,6 +197,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		}
 		data.TotalToQuarantine = totalLosers
 		data.EstimatedSaved = formatSize(totalBytes)
+		data.TotalImages = s.p.Stats.TotalImages
+		data.ProcessingTime = formatScanStats(s.p.Stats)
 	}
 	s.mu.Unlock()
 
@@ -665,12 +667,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
 	results, err := apply.Apply(p)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.recordResult("apply", results)
+	s.recordResult("apply", results, time.Since(start))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -692,16 +695,17 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
 	results, err := apply.Restore(p)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.recordResult("restore", results)
+	s.recordResult("restore", results, time.Since(start))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (s *Server) recordResult(action string, results []apply.Result) {
+func (s *Server) recordResult(action string, results []apply.Result, elapsed time.Duration) {
 	var winners, losers, drift, missing int
 	for _, r := range results {
 		switch {
@@ -715,8 +719,8 @@ func (s *Server) recordResult(action string, results []apply.Result) {
 			missing++
 		}
 	}
-	text := fmt.Sprintf("%s complete: %d winners moved, %d losers moved, %d skipped (drift), %d skipped (missing)",
-		action, winners, losers, drift, missing)
+	text := fmt.Sprintf("%s complete: %d winners moved, %d losers moved, %d skipped (drift), %d skipped (missing) — %d file(s) in %s",
+		action, winners, losers, drift, missing, len(results), elapsed.Round(10*time.Millisecond))
 	s.setBanner(text, false)
 }
 
@@ -765,6 +769,17 @@ func formatSize(bytes int64) string {
 	}
 }
 
+// formatScanStats renders a scan's performance figures as "3.4s (12.3
+// images/sec)", or just the duration when there's nothing to divide by.
+func formatScanStats(s plan.Stats) string {
+	d := time.Duration(s.DurationMS) * time.Millisecond
+	if s.TotalImages == 0 || s.DurationMS == 0 {
+		return d.Round(10 * time.Millisecond).String()
+	}
+	rate := float64(s.TotalImages) / (float64(s.DurationMS) / 1000)
+	return fmt.Sprintf("%s (%.1f images/sec)", d.Round(10*time.Millisecond), rate)
+}
+
 type groupView struct {
 	ID     int
 	Winner imageView
@@ -784,6 +799,8 @@ type pageData struct {
 	Groups            []groupView
 	TotalToQuarantine int
 	EstimatedSaved    string
+	TotalImages       int
+	ProcessingTime    string
 }
 
 var indexTmpl = template.Must(template.New("index").Parse(indexHTML))
@@ -1571,6 +1588,8 @@ const indexHTML = `<!doctype html>
 
   {{if .Groups}}
   <div class="stats-row">
+    <span class="stat"><strong>{{.TotalImages}}</strong> image{{if ne .TotalImages 1}}s{{end}} processed</span>
+    <span class="stat">in <strong>{{.ProcessingTime}}</strong></span>
     <span class="stat"><strong>{{len .Groups}}</strong> group{{if ne (len .Groups) 1}}s{{end}}</span>
     <span class="stat"><strong>{{.TotalToQuarantine}}</strong> photo{{if ne .TotalToQuarantine 1}}s{{end}} to quarantine</span>
     <span class="stat">~<strong>{{.EstimatedSaved}}</strong> reclaimed on apply</span>
