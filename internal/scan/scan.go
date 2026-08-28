@@ -82,6 +82,8 @@ type entry struct {
 // Run performs a full scan and returns the resulting Plan along with
 // any files that were skipped.
 func Run(opts Options) (plan.Plan, []Warning, error) {
+	start := time.Now()
+
 	paths, err := discover(opts.Root)
 
 	if err != nil {
@@ -104,6 +106,11 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 		GapSeconds:  int(opts.GapThreshold.Seconds()),
 		GeneratedAt: time.Now().UTC(),
 		Groups:      groups,
+		Stats: plan.Stats{
+			TotalImages: len(paths),
+			Warnings:    len(warnings),
+			DurationMS:  time.Since(start).Milliseconds(),
+		},
 	}
 	return p, warnings, nil
 }

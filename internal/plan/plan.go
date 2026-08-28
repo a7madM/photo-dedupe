@@ -28,6 +28,14 @@ type Group struct {
 	Losers []FileRecord `json:"losers"`
 }
 
+// Stats holds scan-time performance figures — not derivable from
+// Groups alone, since most processed images never end up in one.
+type Stats struct {
+	TotalImages int   `json:"total_images"`
+	Warnings    int   `json:"warnings"`
+	DurationMS  int64 `json:"duration_ms"`
+}
+
 // Plan is the full output of a scan.
 type Plan struct {
 	Version     int       `json:"version"`
@@ -35,6 +43,7 @@ type Plan struct {
 	GapSeconds  int       `json:"gap_seconds"`
 	GeneratedAt time.Time `json:"generated_at"`
 	Groups      []Group   `json:"groups"`
+	Stats       Stats     `json:"stats"`
 }
 
 // Write serializes p as indented JSON to w.
