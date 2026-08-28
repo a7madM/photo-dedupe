@@ -296,7 +296,7 @@ func discover(root string) ([]string, error) {
 		return nil, err
 	}
 
-	var paths []string
+	paths := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() {
 			continue

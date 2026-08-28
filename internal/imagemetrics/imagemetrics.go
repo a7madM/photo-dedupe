@@ -84,6 +84,13 @@ func Decode(path string) (image.Image, error) {
 func decodeHEIC(path string) (image.Image, error) {
 	cmd := exec.Command("magick", path, "png:-")
 	var stdout, stderr bytes.Buffer
+	// magick's PNG output is typically several times the HEIC input's
+	// size; sizing the buffer off the source file avoids the repeated
+	// grow-and-copy a from-empty bytes.Buffer would do while stdout
+	// streams in.
+	if info, err := os.Stat(path); err == nil {
+		stdout.Grow(int(info.Size()) * 4)
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -104,21 +111,14 @@ func sharpness(img image.Image) float64 {
 		return 0
 	}
 
-	gray := make([][]float64, h)
-	for y := 0; y < h; y++ {
-		gray[y] = make([]float64, w)
-		for x := 0; x < w; x++ {
-			r, g, b, _ := img.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
-			// Standard luminance weighting, values in 0..65535.
-			gray[y][x] = 0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)
-		}
-	}
+	gray := grayscale(img, bounds, w, h)
 
 	var sum, sumSq float64
 	var n float64
 	for y := 1; y < h-1; y++ {
+		row, up, down := gray[y*w:], gray[(y-1)*w:], gray[(y+1)*w:]
 		for x := 1; x < w-1; x++ {
-			lap := gray[y-1][x] + gray[y+1][x] + gray[y][x-1] + gray[y][x+1] - 4*gray[y][x]
+			lap := up[x] + down[x] + row[x-1] + row[x+1] - 4*row[x]
 			sum += lap
 			sumSq += lap * lap
 			n++
@@ -129,4 +129,71 @@ func sharpness(img image.Image) float64 {
 	}
 	mean := sum / n
 	return sumSq/n - mean*mean
+}
+
+// grayscale renders img as a flat, row-major w*h luminance buffer
+// using the standard 0.299/0.587/0.114 weighting over 0..65535 RGBA
+// values. A single flat slice (rather than one []float64 per row)
+// means one allocation instead of h, and the fast-path cases below
+// read decoded pixel bytes directly instead of going through
+// image.Image.At — a per-pixel interface call that both boxes a
+// color.Color onto the heap and re-derives RGB through that type's
+// general-purpose ColorModel conversion.
+//
+// *image.Gray and *image.RGBA are exact: their At/RGBA methods are
+// simple enough that reading the underlying bytes directly reproduces
+// the same values bit-for-bit (Gray has R=G=B=Y, and the fixed
+// weights sum to 1; RGBA's bytes are already the premultiplied values
+// RGBA() returns). *image.YCbCr (what the stdlib JPEG decoder
+// produces, the dominant real-world format here) is a documented
+// near-exact stand-in: Y is JPEG's own luma channel, mathematically
+// equal to this same weighted RGB sum by construction of the YCbCr
+// color space, modulo sub-ULP rounding and clipping on extreme,
+// highly saturated colors — negligible for a heuristic score that's
+// only ever compared relatively within one similarity group. Anything
+// else (paletted, CMYK, NRGBA with partial alpha, ...) falls back to
+// the general At() path, unchanged from before.
+func grayscale(img image.Image, bounds image.Rectangle, w, h int) []float64 {
+	gray := make([]float64, w*h)
+
+	switch src := img.(type) {
+	case *image.Gray:
+		for y := 0; y < h; y++ {
+			off := src.PixOffset(bounds.Min.X, bounds.Min.Y+y)
+			row := src.Pix[off : off+w]
+			out := gray[y*w : y*w+w]
+			for x, v := range row {
+				out[x] = float64(v) * 257 // Y*0x101, matches color.Gray.RGBA()
+			}
+		}
+	case *image.YCbCr:
+		for y := 0; y < h; y++ {
+			off := src.YOffset(bounds.Min.X, bounds.Min.Y+y)
+			row := src.Y[off : off+w]
+			out := gray[y*w : y*w+w]
+			for x, v := range row {
+				out[x] = float64(v) * 257
+			}
+		}
+	case *image.RGBA:
+		for y := 0; y < h; y++ {
+			off := src.PixOffset(bounds.Min.X, bounds.Min.Y+y)
+			row := src.Pix[off : off+4*w]
+			out := gray[y*w : y*w+w]
+			for x := 0; x < w; x++ {
+				i := x * 4
+				r, g, b := float64(row[i]), float64(row[i+1]), float64(row[i+2])
+				out[x] = (0.299*r + 0.587*g + 0.114*b) * 257
+			}
+		}
+	default:
+		for y := 0; y < h; y++ {
+			out := gray[y*w : y*w+w]
+			for x := 0; x < w; x++ {
+				r, g, b, _ := img.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
+				out[x] = 0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)
+			}
+		}
+	}
+	return gray
 }

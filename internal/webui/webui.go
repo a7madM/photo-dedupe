@@ -6,6 +6,8 @@
 package webui
 
 import (
+	"bytes"
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -60,15 +62,23 @@ type Server struct {
 	scanCurrent   int
 	scanTotal     int
 	scanPath      string
+
+	// heicCache holds re-encoded JPEG bytes for HEIC/HEIF images
+	// served by handleImage, keyed on path+mtime — decoding (shelling
+	// out to magick) and re-encoding a full-resolution photo is
+	// expensive, and a reviewer's browser re-requests the same handful
+	// of images every reload/scroll.
+	heicCache *imageCache
 }
 
 // New builds a Server with no plan loaded yet.
 func New() *Server {
 	s := &Server{
-		allowed: map[string]bool{},
-		gapStr:  defaultGap,
-		simStr:  defaultSimilarity,
-		blurStr: defaultBlur,
+		allowed:   map[string]bool{},
+		gapStr:    defaultGap,
+		simStr:    defaultSimilarity,
+		blurStr:   defaultBlur,
+		heicCache: newImageCache(64),
 	}
 
 	mux := http.NewServeMux()
@@ -87,6 +97,56 @@ func New() *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
+}
+
+// imageCache is a small, bounded, concurrency-safe LRU byte cache.
+// Capacity is measured in entries, not bytes: handleImage only ever
+// stores JPEG-re-encoded HEIC images, all roughly comparable in size,
+// so an entry count bounds memory closely enough without tracking
+// byte sizes.
+type imageCache struct {
+	mu       sync.Mutex
+	capacity int
+	ll       *list.List
+	items    map[string]*list.Element
+}
+
+type imageCacheEntry struct {
+	key  string
+	data []byte
+}
+
+func newImageCache(capacity int) *imageCache {
+	return &imageCache{capacity: capacity, ll: list.New(), items: make(map[string]*list.Element)}
+}
+
+func (c *imageCache) get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	c.ll.MoveToFront(el)
+	return el.Value.(*imageCacheEntry).data, true
+}
+
+func (c *imageCache) put(key string, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.ll.MoveToFront(el)
+		el.Value.(*imageCacheEntry).data = data
+		return
+	}
+
+	el := c.ll.PushFront(&imageCacheEntry{key: key, data: data})
+	c.items[key] = el
+	if c.ll.Len() > c.capacity {
+		oldest := c.ll.Back()
+		c.ll.Remove(oldest)
+		delete(c.items, oldest.Value.(*imageCacheEntry).key)
+	}
 }
 
 func allowedPaths(p plan.Plan) map[string]bool {
@@ -401,7 +461,9 @@ func shortcuts() []browseEntry {
 // handleImage serves the raw bytes of an image referenced by the
 // current plan. JPEG/PNG are streamed as-is; HEIC/HEIF is decoded and
 // re-encoded as JPEG on the fly, since most browsers other than
-// Safari can't render HEIC directly.
+// Safari can't render HEIC directly — the re-encoded result is cached
+// in heicCache, since a review session repeatedly re-requests the
+// same images (page reload, scroll back up).
 func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 
@@ -415,15 +477,7 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == ".heic" || ext == ".heif" {
-		img, err := imagemetrics.Decode(path)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "image/jpeg")
-		if err := jpeg.Encode(w, img, &jpeg.Options{Quality: 85}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		s.serveHEICAsJPEG(w, path)
 		return
 	}
 
@@ -439,7 +493,39 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 		ct = "image/png"
 	}
 	w.Header().Set("Content-Type", ct)
+	if info, err := f.Stat(); err == nil {
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	}
 	io.Copy(w, f)
+}
+
+func (s *Server) serveHEICAsJPEG(w http.ResponseWriter, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	key := path + "@" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+
+	data, ok := s.heicCache.get(key)
+	if !ok {
+		img, err := imagemetrics.Decode(path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data = buf.Bytes()
+		s.heicCache.put(key, data)
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
 }
 
 // selectWinnerResponse is served by handleSelectWinner when the caller
