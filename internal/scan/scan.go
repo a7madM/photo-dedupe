@@ -55,6 +55,17 @@ type Options struct {
 	// each file is independent. Zero or negative defaults to
 	// runtime.NumCPU().
 	Concurrency int
+
+	// Limit caps how many of the directory's supported images a scan
+	// processes, taken in os.ReadDir's filename order (so the same
+	// subset is chosen on every run against an unchanged directory).
+	// Files beyond the cap are simply left out — reported via
+	// Plan.Stats, not as a Warning, since a Warning specifically means
+	// a file was attempted and failed. Zero or negative means
+	// unlimited; callers wanting the "large library" default of 1000
+	// (this package doesn't impose one itself) should set it
+	// explicitly.
+	Limit int
 }
 
 // Warning records a file that was skipped rather than causing the
@@ -84,7 +95,7 @@ type entry struct {
 func Run(opts Options) (plan.Plan, []Warning, error) {
 	start := time.Now()
 
-	paths, err := discover(opts.Root)
+	paths, totalFound, err := discover(opts.Root, opts.Limit)
 
 	if err != nil {
 		return plan.Plan{}, nil, err
@@ -97,6 +108,11 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 
 	entries, warnings := resolveEntries(paths, opts.Concurrency, progress)
 
+	var totalSizeBytes int64
+	for _, e := range entries {
+		totalSizeBytes += e.metrics.SizeBytes
+	}
+
 	groups, groupWarnings := buildGroups(entries, opts.GapThreshold, opts.SimilarityThreshold, opts.BlurThreshold)
 	warnings = append(warnings, groupWarnings...)
 
@@ -107,9 +123,11 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 		GeneratedAt: time.Now().UTC(),
 		Groups:      groups,
 		Stats: plan.Stats{
-			TotalImages: len(paths),
-			Warnings:    len(warnings),
-			DurationMS:  time.Since(start).Milliseconds(),
+			TotalFound:     totalFound,
+			TotalImages:    len(paths),
+			TotalSizeBytes: totalSizeBytes,
+			Warnings:       len(warnings),
+			DurationMS:     time.Since(start).Milliseconds(),
 		},
 	}
 	return p, warnings, nil
@@ -234,6 +252,31 @@ func resolveEntries(paths []string, concurrency int, progress func(index, total 
 		done     int
 	)
 
+	// progress is often a terminal or log write, and terminals/log
+	// destinations can get noticeably slower to append to as output
+	// accumulates. Calling it directly inside the critical section
+	// below would mean every worker blocks on the same mutex while
+	// that write happens — one slow print throttles the entire pool,
+	// however fast decoding/hashing itself still is. Routing it
+	// through a generously buffered channel to a single reporter
+	// goroutine means a worker only ever pays the cost of a channel
+	// send (fast, never blocks on I/O), while the channel's FIFO order
+	// — combined with done being assigned before the send, still under
+	// the lock — preserves the "one call per file, strictly
+	// increasing" guarantee below exactly as before.
+	type update struct {
+		done int
+		path string
+	}
+	progressCh := make(chan update, len(paths))
+	reporterDone := make(chan struct{})
+	go func() {
+		defer close(reporterDone)
+		for u := range progressCh {
+			progress(u.done, len(paths), u.path)
+		}
+	}()
+
 	jobs := make(chan string)
 	var wg sync.WaitGroup
 	for w := 0; w < concurrency; w++ {
@@ -250,8 +293,10 @@ func resolveEntries(paths []string, concurrency int, progress func(index, total 
 					entries = append(entries, e)
 				}
 				done++
-				progress(done, len(paths), path)
+				d := done
 				mu.Unlock()
+
+				progressCh <- update{d, path}
 			}
 		}()
 	}
@@ -260,6 +305,8 @@ func resolveEntries(paths []string, concurrency int, progress func(index, total 
 	}
 	close(jobs)
 	wg.Wait()
+	close(progressCh)
+	<-reporterDone
 
 	return entries, warnings
 }
@@ -293,24 +340,33 @@ func toFileRecord(c pick.Candidate) (plan.FileRecord, error) {
 	}, nil
 }
 
-// discover returns every supported image file directly inside root.
-// The directory is treated as flat: subdirectories (including
-// dedupe-kept/ and dedupe-quarantine/ from a prior apply) are never
-// descended into.
-func discover(root string) ([]string, error) {
+// discover returns every supported image file directly inside root,
+// capped at limit (zero or negative means unlimited). The directory
+// is treated as flat: subdirectories (including dedupe-kept/ and
+// dedupe-quarantine/ from a prior apply) are never descended into.
+// total is the number of supported files found before any cap, so a
+// capped caller can report how many were left out; os.ReadDir already
+// returns entries in filename order, so a repeated scan of an
+// unchanged directory always caps to the same subset.
+func discover(root string, limit int) (paths []string, total int, err error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	paths := make([]string, 0, len(entries))
+	paths = make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if supportedExt[strings.ToLower(filepath.Ext(e.Name()))] {
-			paths = append(paths, filepath.Join(root, e.Name()))
+		if !supportedExt[strings.ToLower(filepath.Ext(e.Name()))] {
+			continue
 		}
+		total++
+		if limit > 0 && total > limit {
+			continue
+		}
+		paths = append(paths, filepath.Join(root, e.Name()))
 	}
-	return paths, nil
+	return paths, total, nil
 }

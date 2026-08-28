@@ -203,6 +203,78 @@ func TestRun_NilProgressIsOptional(t *testing.T) {
 	}
 }
 
+func TestRun_LimitCapsProcessedFiles(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	for i := 0; i < 5; i++ {
+		writePNG(t, filepath.Join(root, "img"+string(rune('a'+i))+".png"), flat(64), base.Add(time.Duration(i)*time.Hour))
+	}
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9, Limit: 3})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if p.Stats.TotalFound != 5 {
+		t.Fatalf("Stats.TotalFound = %d, want 5", p.Stats.TotalFound)
+	}
+	if p.Stats.TotalImages != 3 {
+		t.Fatalf("Stats.TotalImages = %d, want 3 (capped by Limit)", p.Stats.TotalImages)
+	}
+}
+
+func TestRun_LimitZeroIsUnlimited(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	for i := 0; i < 5; i++ {
+		writePNG(t, filepath.Join(root, "img"+string(rune('a'+i))+".png"), flat(64), base.Add(time.Duration(i)*time.Hour))
+	}
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if p.Stats.TotalFound != 5 || p.Stats.TotalImages != 5 {
+		t.Fatalf("Stats = %+v, want TotalFound=5 TotalImages=5 (no Limit set)", p.Stats)
+	}
+}
+
+func TestRun_TotalSizeBytesSumsAllProcessedImagesNotJustGrouped(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+
+	// All far apart in time and visually distinct -> zero Groups, but
+	// every file was still processed and should count toward
+	// TotalSizeBytes.
+	paths := []string{
+		filepath.Join(root, "a.png"),
+		filepath.Join(root, "b.png"),
+		filepath.Join(root, "c.png"),
+	}
+	writePNG(t, paths[0], checkerboard(64), base)
+	writePNG(t, paths[1], flat(64), base.Add(2*time.Hour))
+	writePNG(t, paths[2], quadrants(64), base.Add(4*time.Hour))
+
+	var wantSize int64
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat fixture: %v", err)
+		}
+		wantSize += info.Size()
+	}
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(p.Groups) != 0 {
+		t.Fatalf("Groups = %+v, want none (all images distinct/far apart)", p.Groups)
+	}
+	if p.Stats.TotalSizeBytes != wantSize {
+		t.Fatalf("Stats.TotalSizeBytes = %d, want %d (sum across all processed images, even ungrouped ones)", p.Stats.TotalSizeBytes, wantSize)
+	}
+}
+
 func TestRun_GroupsDuplicatesWithinTimeAndSimilarity(t *testing.T) {
 	root := t.TempDir()
 	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)

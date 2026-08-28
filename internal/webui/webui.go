@@ -34,6 +34,7 @@ const (
 	defaultGap        = "20s"
 	defaultSimilarity = "8"
 	defaultBlur       = "5e6"
+	defaultLimit      = "1000"
 )
 
 // Server is an http.Handler serving a directory-picker + gallery view.
@@ -52,6 +53,7 @@ type Server struct {
 	gapStr      string
 	simStr      string
 	blurStr     string
+	limitStr    string
 
 	// scanning tracks a scan running in the background so handleIndex
 	// can render its progress and handleScan can refuse to start a
@@ -78,6 +80,7 @@ func New() *Server {
 		gapStr:    defaultGap,
 		simStr:    defaultSimilarity,
 		blurStr:   defaultBlur,
+		limitStr:  defaultLimit,
 		heicCache: newImageCache(64),
 	}
 
@@ -178,6 +181,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		GapStr:      s.gapStr,
 		SimStr:      s.simStr,
 		BlurStr:     s.blurStr,
+		LimitStr:    s.limitStr,
 		BannerText:  s.bannerText,
 		BannerError: s.bannerError,
 		Warnings:    s.warnings,
@@ -199,6 +203,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		data.EstimatedSaved = formatSize(totalBytes)
 		data.TotalImages = s.p.Stats.TotalImages
 		data.ProcessingTime = formatScanStats(s.p.Stats)
+		data.SkippedByLimit = s.p.Stats.TotalFound - s.p.Stats.TotalImages
+		data.TotalLibrarySize = formatSize(s.p.Stats.TotalSizeBytes)
+		data.ReclaimPercent = reclaimPercent(totalBytes, s.p.Stats.TotalSizeBytes)
 	}
 	s.mu.Unlock()
 
@@ -227,6 +234,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	gapStr := formValueOr(r, "gap", defaultGap)
 	simStr := formValueOr(r, "similarity", defaultSimilarity)
 	blurStr := formValueOr(r, "blur", defaultBlur)
+	limitStr := formValueOr(r, "limit", defaultLimit)
 
 	if dir == "" {
 		s.setBanner("choose a directory to scan", true)
@@ -249,6 +257,12 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	blur, err := strconv.ParseFloat(blurStr, 64)
 	if err != nil {
 		s.setBanner(fmt.Sprintf("invalid blur %q: %v", blurStr, err), true)
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		s.setBanner(fmt.Sprintf("invalid limit %q: %v", limitStr, err), true)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -287,6 +301,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 			GapThreshold:        gap,
 			SimilarityThreshold: sim,
 			BlurThreshold:       blur,
+			Limit:               limit,
 			Progress: func(current, total int, path string) {
 				s.mu.Lock()
 				s.scanCurrent = current
@@ -314,8 +329,11 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		s.p = p
 		s.allowed = allowedPaths(p)
 		s.warnings = warnings
-		s.gapStr, s.simStr, s.blurStr = gapStr, simStr, blurStr
+		s.gapStr, s.simStr, s.blurStr, s.limitStr = gapStr, simStr, blurStr, limitStr
 		s.bannerText = fmt.Sprintf("scanned %s: %d group(s) found", root, len(p.Groups))
+		if skipped := p.Stats.TotalFound - p.Stats.TotalImages; skipped > 0 {
+			s.bannerText += fmt.Sprintf(" (%d image(s) left out by the %d-image limit — raise it to include them)", skipped, limit)
+		}
 		s.bannerError = false
 	}()
 
@@ -780,6 +798,15 @@ func formatScanStats(s plan.Stats) string {
 	return fmt.Sprintf("%s (%.1f images/sec)", d.Round(10*time.Millisecond), rate)
 }
 
+// reclaimPercent renders "12.3%" for what spaceBytes is of totalBytes,
+// or "" when there's nothing to divide by.
+func reclaimPercent(spaceBytes, totalBytes int64) string {
+	if totalBytes == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.1f%%", float64(spaceBytes)/float64(totalBytes)*100)
+}
+
 type groupView struct {
 	ID     int
 	Winner imageView
@@ -793,6 +820,7 @@ type pageData struct {
 	GapStr            string
 	SimStr            string
 	BlurStr           string
+	LimitStr          string
 	BannerText        string
 	BannerError       bool
 	Warnings          []scan.Warning
@@ -801,6 +829,9 @@ type pageData struct {
 	EstimatedSaved    string
 	TotalImages       int
 	ProcessingTime    string
+	SkippedByLimit    int
+	TotalLibrarySize  string
+	ReclaimPercent    string
 }
 
 var indexTmpl = template.Must(template.New("index").Parse(indexHTML))
@@ -1560,6 +1591,24 @@ const indexHTML = `<!doctype html>
         </div>
         <div class="dial-scale"><span>Strict</span><span>Forgiving</span></div>
       </div>
+      <div class="dial">
+        <div class="dial-label-row">
+          <label for="limit-text">Limit</label>
+          <span class="hint-wrap">
+            <button type="button" class="hint-btn" aria-label="What does Limit do?" aria-describedby="hint-limit-body">?</button>
+            <div class="hint-pop" role="tooltip" id="hint-limit-body">
+              <span class="hint-title">Images per scan</span>
+              Caps how many images one scan processes, so a very large library doesn't turn into a very long wait. Images beyond the cap are simply left out — 0 means no limit.
+              <div class="hint-default">Default: 1,000</div>
+            </div>
+          </span>
+        </div>
+        <div class="dial-control">
+          <input type="range" id="limit-range" min="0" max="10000" step="100" aria-label="Image limit">
+          <input type="text" id="limit-text" name="limit" form="scan-form" value="{{.LimitStr}}" size="6">
+        </div>
+        <div class="dial-scale"><span>Fewer</span><span>Unlimited</span></div>
+      </div>
       <button type="submit" form="scan-form" class="shutter-btn" aria-label="Run scan"{{if .Scanning}} disabled{{end}}>SCAN</button>
     </div>
 
@@ -1592,7 +1641,9 @@ const indexHTML = `<!doctype html>
     <span class="stat">in <strong>{{.ProcessingTime}}</strong></span>
     <span class="stat"><strong>{{len .Groups}}</strong> group{{if ne (len .Groups) 1}}s{{end}}</span>
     <span class="stat"><strong>{{.TotalToQuarantine}}</strong> photo{{if ne .TotalToQuarantine 1}}s{{end}} to quarantine</span>
-    <span class="stat">~<strong>{{.EstimatedSaved}}</strong> reclaimed on apply</span>
+    <span class="stat"><strong>{{.TotalLibrarySize}}</strong> processed</span>
+    <span class="stat">~<strong>{{.EstimatedSaved}}</strong> reclaimed on apply{{if .ReclaimPercent}} (<strong>{{.ReclaimPercent}}</strong> of library){{end}}</span>
+    {{if gt .SkippedByLimit 0}}<span class="stat">&mdash; <strong>{{.SkippedByLimit}}</strong> more left out by the limit</span>{{end}}
   </div>
   {{end}}
 
@@ -1814,6 +1865,7 @@ const indexHTML = `<!doctype html>
   bindDurationDial('gap-range', 'gap-text');
   bindDial('similarity-range', 'similarity-text');
   bindDial('blur-range', 'blur-text');
+  bindDial('limit-range', 'limit-text');
 
   document.getElementById('browse-open-btn').addEventListener('click', openBrowser);
   dirField.addEventListener('click', openBrowser);

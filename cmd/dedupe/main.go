@@ -67,6 +67,7 @@ func runScan(args []string) error {
 	gap := fs.Duration("gap", 20*time.Second, "max gap between consecutive shots to stay in the same time-cluster")
 	similarity := fs.Int("similarity", 8, "max perceptual-hash Hamming distance to treat two images as the same shot (needs tuning against your own photos)")
 	blur := fs.Float64("blur", 5e6, "sharpness margin below a group's best before a candidate is excluded from winning (needs tuning against your own photos)")
+	limit := fs.Int("limit", 1000, "max images to process in one scan (0 = unlimited); keeps runtime bounded on very large directories")
 	out := fs.String("out", "", "plan output path (default: <directory>/.dedupe-plan.json)")
 	logPath := fs.String("log", "", "also write progress logs to this file (progress always prints to the terminal)")
 	if err := fs.Parse(args); err != nil {
@@ -100,6 +101,7 @@ func runScan(args []string) error {
 		GapThreshold:        *gap,
 		SimilarityThreshold: *similarity,
 		BlurThreshold:       *blur,
+		Limit:               *limit,
 		Progress: func(index, total int, path string) {
 			fmt.Fprintf(progressOut, "[%d/%d] %s\n", index, total, path)
 		},
@@ -131,8 +133,13 @@ func runScan(args []string) error {
 	fmt.Printf("processing time:     %s\n", formatStats(p.Stats))
 	fmt.Printf("groups found:        %d\n", len(p.Groups))
 	fmt.Printf("files to quarantine: %d\n", loserCount)
-	fmt.Printf("space reclaimable:   %.1f MB\n", float64(spaceBytes)/1e6)
+	fmt.Printf("total library size:  %.1f MB\n", float64(p.Stats.TotalSizeBytes)/1e6)
+	fmt.Printf("space reclaimable:   %.1f MB%s\n", float64(spaceBytes)/1e6, reclaimPercent(spaceBytes, p.Stats.TotalSizeBytes))
 	fmt.Printf("plan written to:     %s\n", outPath)
+	if p.Stats.TotalFound > p.Stats.TotalImages {
+		fmt.Printf("\nnote: %d image(s) found but left out by -limit %d — rerun with a higher -limit (or -limit 0 for unlimited) to include them\n",
+			p.Stats.TotalFound-p.Stats.TotalImages, *limit)
+	}
 	if len(warnings) > 0 {
 		fmt.Printf("skipped %d file(s) (never treated as deletion candidates):\n", len(warnings))
 		for _, w := range warnings {
@@ -245,4 +252,13 @@ func formatStats(s plan.Stats) string {
 	}
 	rate := float64(s.TotalImages) / (float64(s.DurationMS) / 1000)
 	return fmt.Sprintf("%s (%.1f images/sec)", d.Round(10*time.Millisecond), rate)
+}
+
+// reclaimPercent renders " (N% of library)" for the space-reclaimable
+// line, or "" when there's nothing to divide by.
+func reclaimPercent(spaceBytes, totalBytes int64) string {
+	if totalBytes == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%.1f%% of library)", float64(spaceBytes)/float64(totalBytes)*100)
 }

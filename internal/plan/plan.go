@@ -31,9 +31,19 @@ type Group struct {
 // Stats holds scan-time performance figures — not derivable from
 // Groups alone, since most processed images never end up in one.
 type Stats struct {
-	TotalImages int   `json:"total_images"`
-	Warnings    int   `json:"warnings"`
-	DurationMS  int64 `json:"duration_ms"`
+	// TotalFound is how many supported images exist directly in Root,
+	// before any Limit was applied.
+	TotalFound int `json:"total_found"`
+	// TotalImages is how many of those were actually processed —
+	// equal to TotalFound unless Limit capped it.
+	TotalImages int `json:"total_images"`
+	// TotalSizeBytes sums SizeBytes across every processed image, not
+	// just the ones that ended up in a Group — the denominator for a
+	// meaningful "% of your library reclaimed" figure, since most
+	// processed images are usually never a duplicate at all.
+	TotalSizeBytes int64 `json:"total_size_bytes"`
+	Warnings       int   `json:"warnings"`
+	DurationMS     int64 `json:"duration_ms"`
 }
 
 // Plan is the full output of a scan.
