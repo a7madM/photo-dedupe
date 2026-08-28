@@ -87,10 +87,13 @@ options, call into the corresponding package, and print/format the result.
 
 ### Directory safety invariant
 
-`dedupe-kept/` and `dedupe-quarantine/` (constants `apply.KeptDirName`,
-`apply.QuarantineDirName`) are always excluded by `scan`'s directory walk.
-This is what makes re-running `scan` on the same root after an `apply` safe
-and idempotent — don't remove that exclusion without preserving the
+`scan` treats the scanned directory as flat: it only reads the files
+directly inside it and never descends into subdirectories. That is what
+keeps `dedupe-kept/` and `dedupe-quarantine/` (constants
+`apply.KeptDirName`, `apply.QuarantineDirName`), and anything else nested
+under the root, out of a scan — not a name-based exclusion — which is what
+makes re-running `scan` on the same root after an `apply` safe and
+idempotent. Don't reintroduce recursive discovery without preserving the
 invariant some other way.
 
 ## Notes on testing style

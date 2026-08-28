@@ -5,14 +5,13 @@
 package scan
 
 import (
-	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/a7madM/photo-dedupe/internal/apply"
 	"github.com/a7madM/photo-dedupe/internal/cluster"
 	"github.com/a7madM/photo-dedupe/internal/exiftime"
 	"github.com/a7madM/photo-dedupe/internal/filehash"
@@ -84,6 +83,7 @@ type entry struct {
 // any files that were skipped.
 func Run(opts Options) (plan.Plan, []Warning, error) {
 	paths, err := discover(opts.Root)
+
 	if err != nil {
 		return plan.Plan{}, nil, err
 	}
@@ -95,74 +95,8 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 
 	entries, warnings := resolveEntries(paths, opts.Concurrency, progress)
 
-	byPath := make(map[string]entry, len(entries))
-	items := make([]cluster.Item, 0, len(entries))
-	for _, e := range entries {
-		byPath[e.path] = e
-		items = append(items, cluster.Item{Path: e.path, Timestamp: e.timestamp})
-	}
-
-	timeGroups := cluster.Group(items, opts.GapThreshold)
-
-	var groups []plan.Group
-	nextID := 1
-	for _, timeGroup := range timeGroups {
-		if len(timeGroup) < 2 {
-			continue
-		}
-		groupEntries := make([]entry, len(timeGroup))
-		for i, item := range timeGroup {
-			groupEntries[i] = byPath[item.Path]
-		}
-
-		distFn := func(i, j int) int {
-			d, err := groupEntries[i].metrics.Hash.Distance(groupEntries[j].metrics.Hash)
-			if err != nil {
-				return opts.SimilarityThreshold + 1 // treat as dissimilar
-			}
-			return d
-		}
-		simGroups := simgroup.Group(len(groupEntries), opts.SimilarityThreshold, distFn)
-
-		for _, sg := range simGroups {
-			if len(sg) < 2 {
-				continue
-			}
-			candidates := make([]pick.Candidate, len(sg))
-			for i, idx := range sg {
-				e := groupEntries[idx]
-				candidates[i] = pick.Candidate{
-					Path:      e.path,
-					Sharpness: e.metrics.Sharpness,
-					Width:     e.metrics.Width,
-					Height:    e.metrics.Height,
-					SizeBytes: e.metrics.SizeBytes,
-				}
-			}
-			winner, losers := pick.Pick(candidates, opts.BlurThreshold)
-
-			winnerRecord, err := toFileRecord(winner)
-			if err != nil {
-				warnings = append(warnings, Warning{Path: winner.Path, Reason: "cannot hash file: " + err.Error()})
-				continue
-			}
-			loserRecords := make([]plan.FileRecord, 0, len(losers))
-			for _, l := range losers {
-				r, err := toFileRecord(l)
-				if err != nil {
-					warnings = append(warnings, Warning{Path: l.Path, Reason: "cannot hash file: " + err.Error()})
-					continue
-				}
-				loserRecords = append(loserRecords, r)
-			}
-			if len(loserRecords) == 0 {
-				continue
-			}
-
-			groups = append(groups, plan.Group{ID: nextID, Winner: winnerRecord, Losers: loserRecords})
-			nextID++
-		}
-	}
+	groups, groupWarnings := buildGroups(entries, opts.GapThreshold, opts.SimilarityThreshold, opts.BlurThreshold)
+	warnings = append(warnings, groupWarnings...)
 
 	p := plan.Plan{
 		Version:     1,
@@ -172,6 +106,102 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 		Groups:      groups,
 	}
 	return p, warnings, nil
+}
+
+// buildGroups time-clusters resolved entries, splits each time-cluster
+// into similarity groups by perceptual hash, and turns each similarity
+// group of two or more images into a plan.Group with a chosen winner.
+func buildGroups(entries []entry, gap time.Duration, simThreshold int, blurThreshold float64) ([]plan.Group, []Warning) {
+	timestamps := make([]time.Time, len(entries))
+	for i, e := range entries {
+		timestamps[i] = e.timestamp
+	}
+
+	var groups []plan.Group
+	var warnings []Warning
+	nextID := 1
+	for _, timeIdxs := range cluster.Group(timestamps, gap) {
+		if len(timeIdxs) < 2 {
+			continue
+		}
+		timeClusterEntries := selectEntries(entries, timeIdxs)
+
+		for _, simIdxs := range similarityGroups(timeClusterEntries, simThreshold) {
+			if len(simIdxs) < 2 {
+				continue
+			}
+
+			g, ok, buildWarnings := buildGroup(nextID, selectEntries(timeClusterEntries, simIdxs), blurThreshold)
+			warnings = append(warnings, buildWarnings...)
+			if !ok {
+				continue
+			}
+			groups = append(groups, g)
+			nextID++
+		}
+	}
+	return groups, warnings
+}
+
+// selectEntries returns the entries at idxs, in idxs' order.
+func selectEntries(entries []entry, idxs []int) []entry {
+	out := make([]entry, len(idxs))
+	for i, idx := range idxs {
+		out[i] = entries[idx]
+	}
+	return out
+}
+
+// similarityGroups partitions entries already known to be close in
+// time into similarity clusters by perceptual-hash Hamming distance.
+func similarityGroups(entries []entry, threshold int) [][]int {
+	distFn := func(i, j int) int {
+		d, err := entries[i].metrics.Hash.Distance(entries[j].metrics.Hash)
+		if err != nil {
+			return threshold + 1 // treat as dissimilar
+		}
+		return d
+	}
+	return simgroup.Group(len(entries), threshold, distFn)
+}
+
+// buildGroup picks a winner among a similarity group's entries and
+// assembles a plan.Group, content-hashing the winner and every loser
+// along the way. ok is false when the group ends up with no valid
+// losers to report (e.g. the winner or every loser failed to hash),
+// in which case the caller should drop it.
+func buildGroup(id int, entries []entry, blurThreshold float64) (g plan.Group, ok bool, warnings []Warning) {
+	candidates := make([]pick.Candidate, len(entries))
+	for i, e := range entries {
+		candidates[i] = pick.Candidate{
+			Path:      e.path,
+			Sharpness: e.metrics.Sharpness,
+			Width:     e.metrics.Width,
+			Height:    e.metrics.Height,
+			SizeBytes: e.metrics.SizeBytes,
+		}
+	}
+	winner, losers := pick.Pick(candidates, blurThreshold)
+
+	winnerRecord, err := toFileRecord(winner)
+	if err != nil {
+		return plan.Group{}, false, []Warning{{Path: winner.Path, Reason: "cannot hash file: " + err.Error()}}
+	}
+
+	loserRecords := make([]plan.FileRecord, 0, len(losers))
+	for _, l := range losers {
+		r, err := toFileRecord(l)
+		if err != nil {
+			warnings = append(warnings, Warning{Path: l.Path, Reason: "cannot hash file: " + err.Error()})
+			continue
+		}
+		loserRecords = append(loserRecords, r)
+	}
+	if len(loserRecords) == 0 {
+		return plan.Group{}, false, warnings
+	}
+
+	return plan.Group{ID: id, Winner: winnerRecord, Losers: loserRecords}, true, warnings
 }
 
 // resolveEntries resolves every path's timestamp and image metrics
@@ -256,25 +286,24 @@ func toFileRecord(c pick.Candidate) (plan.FileRecord, error) {
 	}, nil
 }
 
-// discover walks root recursively and returns every supported image
-// file, excluding the kept and quarantine directories so re-scanning
-// the same root after an apply is safe.
+// discover returns every supported image file directly inside root.
+// The directory is treated as flat: subdirectories (including
+// dedupe-kept/ and dedupe-quarantine/ from a prior apply) are never
+// descended into.
 func discover(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+
 	var paths []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
 		}
-		if d.IsDir() {
-			if d.Name() == apply.KeptDirName || d.Name() == apply.QuarantineDirName {
-				return filepath.SkipDir
-			}
-			return nil
+		if supportedExt[strings.ToLower(filepath.Ext(e.Name()))] {
+			paths = append(paths, filepath.Join(root, e.Name()))
 		}
-		if supportedExt[strings.ToLower(filepath.Ext(path))] {
-			paths = append(paths, path)
-		}
-		return nil
-	})
-	return paths, err
+	}
+	return paths, nil
 }

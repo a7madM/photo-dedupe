@@ -5,13 +5,18 @@
 // (e.g. perceptual hash distance) is supplied by the caller.
 package simgroup
 
+import "sort"
+
 // DistanceFunc returns a distance between items i and j (0..n-1).
 // Implementations are expected to be symmetric: dist(i,j) == dist(j,i).
 type DistanceFunc func(i, j int) int
 
 // Group partitions n items (indices 0..n-1) into clusters where an
 // edge exists between i and j whenever dist(i, j) <= threshold.
-// Clusters are returned as slices of indices; order is not specified.
+// Clusters are returned as slices of ascending indices, ordered by
+// each group's smallest index — deterministic for a given n and dist,
+// so callers can rely on repeat runs over the same input producing
+// the same group order.
 func Group(n int, threshold int, dist DistanceFunc) [][]int {
 	if n == 0 {
 		return nil
@@ -44,15 +49,16 @@ func Group(n int, threshold int, dist DistanceFunc) [][]int {
 		}
 	}
 
-	groups := make(map[int][]int)
+	byRoot := make(map[int][]int)
 	for i := 0; i < n; i++ {
 		root := find(i)
-		groups[root] = append(groups[root], i)
+		byRoot[root] = append(byRoot[root], i) // i ascends, so each group stays sorted
 	}
 
-	result := make([][]int, 0, len(groups))
-	for _, g := range groups {
+	result := make([][]int, 0, len(byRoot))
+	for _, g := range byRoot {
 		result = append(result, g)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i][0] < result[j][0] })
 	return result
 }

@@ -96,10 +96,10 @@ func runScan(args []string) error {
 	}
 
 	p, warnings, err := scan.Run(scan.Options{
-		Root:                 root,
-		GapThreshold:         *gap,
-		SimilarityThreshold:  *similarity,
-		BlurThreshold:        *blur,
+		Root:                root,
+		GapThreshold:        *gap,
+		SimilarityThreshold: *similarity,
+		BlurThreshold:       *blur,
 		Progress: func(index, total int, path string) {
 			fmt.Fprintf(progressOut, "[%d/%d] %s\n", index, total, path)
 		},

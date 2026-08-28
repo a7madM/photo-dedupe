@@ -14,12 +14,12 @@ func TestGroup_EmptyInput_ReturnsEmpty(t *testing.T) {
 }
 
 func TestGroup_SingleItem_ReturnsOneGroupWithIt(t *testing.T) {
-	item := Item{Path: "a.jpg", Timestamp: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	ts := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	got := Group([]Item{item}, time.Minute)
+	got := Group([]time.Time{ts}, time.Minute)
 
-	if len(got) != 1 || len(got[0]) != 1 || got[0][0] != item {
-		t.Fatalf("Group([a]) = %v, want [[a]]", got)
+	if len(got) != 1 || len(got[0]) != 1 || got[0][0] != 0 {
+		t.Fatalf("Group([ts]) = %v, want [[0]]", got)
 	}
 }
 
@@ -33,10 +33,10 @@ func at(t *testing.T, hhmmss string) time.Time {
 }
 
 func TestGroup_TwoItemsWithinGap_OneGroup(t *testing.T) {
-	a := Item{Path: "a.jpg", Timestamp: at(t, "12:00:00")}
-	b := Item{Path: "b.jpg", Timestamp: at(t, "12:00:30")}
+	a := at(t, "12:00:00")
+	b := at(t, "12:00:30")
 
-	got := Group([]Item{a, b}, time.Minute)
+	got := Group([]time.Time{a, b}, time.Minute)
 
 	if len(got) != 1 || len(got[0]) != 2 {
 		t.Fatalf("Group(a,b within gap) = %v, want one group of 2", got)
@@ -44,10 +44,10 @@ func TestGroup_TwoItemsWithinGap_OneGroup(t *testing.T) {
 }
 
 func TestGroup_TwoItemsBeyondGap_TwoGroups(t *testing.T) {
-	a := Item{Path: "a.jpg", Timestamp: at(t, "12:00:00")}
-	b := Item{Path: "b.jpg", Timestamp: at(t, "12:05:00")}
+	a := at(t, "12:00:00")
+	b := at(t, "12:05:00")
 
-	got := Group([]Item{a, b}, time.Minute)
+	got := Group([]time.Time{a, b}, time.Minute)
 
 	if len(got) != 2 || len(got[0]) != 1 || len(got[1]) != 1 {
 		t.Fatalf("Group(a,b beyond gap) = %v, want two groups of 1", got)
@@ -55,33 +55,33 @@ func TestGroup_TwoItemsBeyondGap_TwoGroups(t *testing.T) {
 }
 
 func TestGroup_UnsortedInput_SortsBeforeGrouping(t *testing.T) {
-	a := Item{Path: "a.jpg", Timestamp: at(t, "12:00:00")}
-	b := Item{Path: "b.jpg", Timestamp: at(t, "12:00:10")}
-	c := Item{Path: "c.jpg", Timestamp: at(t, "12:10:00")}
+	c := at(t, "12:10:00") // index 0
+	a := at(t, "12:00:00") // index 1
+	b := at(t, "12:00:10") // index 2
 
-	got := Group([]Item{c, a, b}, time.Minute)
+	got := Group([]time.Time{c, a, b}, time.Minute)
 
 	if len(got) != 2 {
 		t.Fatalf("Group(unsorted) = %v, want 2 groups", got)
 	}
-	if got[0][0] != a || got[0][1] != b {
-		t.Fatalf("first group = %v, want [a b] in chronological order", got[0])
+	if len(got[0]) != 2 || got[0][0] != 1 || got[0][1] != 2 {
+		t.Fatalf("first group = %v, want [1 2] (a then b, chronological)", got[0])
 	}
-	if got[1][0] != c {
-		t.Fatalf("second group = %v, want [c]", got[1])
+	if len(got[1]) != 1 || got[1][0] != 0 {
+		t.Fatalf("second group = %v, want [0] (c)", got[1])
 	}
 }
 
 func TestGroup_MultipleGroups_EachSortedInternally(t *testing.T) {
-	a := Item{Path: "a.jpg", Timestamp: at(t, "09:00:00")}
-	b := Item{Path: "b.jpg", Timestamp: at(t, "09:00:20")}
-	c := Item{Path: "c.jpg", Timestamp: at(t, "09:00:40")}
-	d := Item{Path: "d.jpg", Timestamp: at(t, "14:00:00")}
-	e := Item{Path: "e.jpg", Timestamp: at(t, "14:00:15")}
+	e := at(t, "14:00:15") // index 0
+	d := at(t, "14:00:00") // index 1
+	c := at(t, "09:00:40") // index 2
+	b := at(t, "09:00:20") // index 3
+	a := at(t, "09:00:00") // index 4
 
-	got := Group([]Item{e, d, c, b, a}, time.Minute)
+	got := Group([]time.Time{e, d, c, b, a}, time.Minute)
 
-	want := [][]Item{{a, b, c}, {d, e}}
+	want := [][]int{{4, 3, 2}, {1, 0}}
 	if len(got) != len(want) {
 		t.Fatalf("Group(...) = %v, want %v", got, want)
 	}
