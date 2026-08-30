@@ -11,11 +11,12 @@ import (
 )
 
 // heicFixture builds a synthetic HEIC file at path by encoding img as
-// PNG and converting it with the system's `magick` binary. Tests
-// using this skip (rather than fail) when magick isn't available,
-// since HEIC support is an optional runtime dependency, not a Go
-// stdlib capability.
-func heicFixture(t *testing.T, path string, img image.Image) {
+// PNG and converting it with the system's `magick` binary. Callers
+// skip (rather than fail) when magick isn't available, since HEIC
+// support is an optional runtime dependency, not a Go stdlib
+// capability. Takes testing.TB rather than *testing.T so benchmarks
+// can build fixtures the same way tests do.
+func heicFixture(t testing.TB, path string, img image.Image) {
 	t.Helper()
 	if _, err := exec.LookPath("magick"); err != nil {
 		t.Skip("magick not on PATH; skipping HEIC test")
@@ -30,7 +31,7 @@ func heicFixture(t *testing.T, path string, img image.Image) {
 	}
 }
 
-func writePNG(t *testing.T, path string, img image.Image) {
+func writePNG(t testing.TB, path string, img image.Image) {
 	t.Helper()
 	f, err := os.Create(path)
 	if err != nil {
