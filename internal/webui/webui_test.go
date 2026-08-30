@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +44,31 @@ func writePNG(t *testing.T, path string, c color.RGBA, mtime time.Time) {
 	}
 }
 
+func writeJPEG(t *testing.T, path string, c color.RGBA, mtime time.Time) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			img.SetRGBA(x, y, c)
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := jpeg.Encode(f, img, nil); err != nil {
+		f.Close()
+		t.Fatalf("encode: %v", err)
+	}
+	f.Close()
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+}
+
 // writeDuplicatePair writes two identical, close-in-time PNGs into
 // root, guaranteed to land in the same group under scan's defaults.
 func writeDuplicatePair(t *testing.T, root string) {
@@ -58,6 +84,29 @@ func writeDuplicatePair(t *testing.T, root string) {
 func doScan(t *testing.T, s *Server, dir string) *httptest.ResponseRecorder {
 	t.Helper()
 	form := url.Values{"directory": {dir}}
+	req := httptest.NewRequest(http.MethodPost, "/scan", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	waitForScanToFinish(t, s)
+	return rr
+}
+
+// doScanWithFormats is doScan but with explicit control over the
+// three format checkboxes, matching how a browser only ever sends a
+// fmt_* key at all when that checkbox is checked.
+func doScanWithFormats(t *testing.T, s *Server, dir string, jpeg, png, heic bool) *httptest.ResponseRecorder {
+	t.Helper()
+	form := url.Values{"directory": {dir}}
+	if jpeg {
+		form.Set("fmt_jpeg", "1")
+	}
+	if png {
+		form.Set("fmt_png", "1")
+	}
+	if heic {
+		form.Set("fmt_heic", "1")
+	}
 	req := httptest.NewRequest(http.MethodPost, "/scan", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
@@ -255,6 +304,116 @@ func TestIndex_ShowsQuarantineStatsAfterScan(t *testing.T) {
 	}
 	if !strings.Contains(body, "reclaimed on apply") {
 		t.Fatalf("expected an estimated-savings figure in index body, got: %s", body)
+	}
+}
+
+func TestScanCancel_InvokesCancelFuncAndClearsScanning(t *testing.T) {
+	s := New()
+
+	var cancelled bool
+	s.mu.Lock()
+	s.scanning = true
+	s.scanDirectory = "/photos"
+	s.scanCancel = func() { cancelled = true }
+	s.mu.Unlock()
+
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/scan/cancel", nil))
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rr.Code)
+	}
+	if !cancelled {
+		t.Fatal("expected the stored scanCancel func to be invoked")
+	}
+}
+
+func TestScanCancel_NoOpWhenNothingIsScanning(t *testing.T) {
+	s := New()
+
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/scan/cancel", nil))
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 (a no-op, not an error, when nothing is scanning)", rr.Code)
+	}
+}
+
+func TestScanCancel_RejectsGET(t *testing.T) {
+	s := New()
+
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/scan/cancel", nil))
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rr.Code)
+	}
+}
+
+func TestScan_CancelledScanShowsCancelledBanner(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	// Enough files that the background scan can't possibly finish
+	// before the cancel request below is issued on this same
+	// goroutine right after /scan returns — no sleep needed, since
+	// /scan itself only spawns the work and returns immediately.
+	for i := 0; i < 400; i++ {
+		writePNG(t, filepath.Join(root, "img"+strconv.Itoa(i)+".png"), color.RGBA{200, 50, 50, 255}, base.Add(time.Duration(i)*time.Second))
+	}
+
+	s := New()
+
+	form := url.Values{"directory": {root}}
+	req := httptest.NewRequest(http.MethodPost, "/scan", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.ServeHTTP(httptest.NewRecorder(), req)
+
+	s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/scan/cancel", nil))
+
+	waitForScanToFinish(t, s)
+
+	s.mu.Lock()
+	banner, hasPlan := s.bannerText, s.hasPlan
+	s.mu.Unlock()
+	if hasPlan {
+		t.Fatalf("hasPlan = true, want the cancelled scan to leave no plan loaded")
+	}
+	if !strings.Contains(banner, "cancelled") {
+		t.Fatalf("bannerText = %q, want it to mention the scan was cancelled", banner)
+	}
+}
+
+func TestScan_FormatSelectionFiltersExtensions(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	writePNG(t, filepath.Join(root, "a.png"), color.RGBA{200, 50, 50, 255}, base)
+	writeJPEG(t, filepath.Join(root, "b.jpg"), color.RGBA{50, 200, 50, 255}, base.Add(time.Hour))
+
+	s := New()
+	doScanWithFormats(t, s, root, false, true, false) // PNG only
+
+	s.mu.Lock()
+	total := s.p.Stats.TotalImages
+	s.mu.Unlock()
+	if total != 1 {
+		t.Fatalf("Stats.TotalImages = %d, want 1 (only the .png, JPEG unchecked)", total)
+	}
+}
+
+func TestScan_NoFormatCheckedScansEverySupportedFormat(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	writePNG(t, filepath.Join(root, "a.png"), color.RGBA{200, 50, 50, 255}, base)
+	writeJPEG(t, filepath.Join(root, "b.jpg"), color.RGBA{50, 200, 50, 255}, base.Add(time.Hour))
+
+	s := New()
+	// A browser sends no fmt_* key at all once every box is unchecked,
+	// same as if the page had never offered the choice — that should
+	// fall back to scanning everything, not zero files.
+	doScanWithFormats(t, s, root, false, false, false)
+
+	s.mu.Lock()
+	total := s.p.Stats.TotalImages
+	s.mu.Unlock()
+	if total != 2 {
+		t.Fatalf("Stats.TotalImages = %d, want 2 (no format checkbox present falls back to all formats)", total)
 	}
 }
 

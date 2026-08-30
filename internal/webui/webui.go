@@ -8,7 +8,9 @@ package webui
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"image/jpeg"
@@ -54,16 +56,20 @@ type Server struct {
 	simStr      string
 	blurStr     string
 	limitStr    string
+	fmtJPEG     bool
+	fmtPNG      bool
+	fmtHEIC     bool
 
 	// scanning tracks a scan running in the background so handleIndex
 	// can render its progress and handleScan can refuse to start a
 	// second one on top of it. scanDirectory/scanCurrent/scanTotal/
-	// scanPath are only meaningful while scanning is true.
+	// scanPath/scanCancel are only meaningful while scanning is true.
 	scanning      bool
 	scanDirectory string
 	scanCurrent   int
 	scanTotal     int
 	scanPath      string
+	scanCancel    context.CancelFunc
 
 	// heicCache holds re-encoded JPEG bytes for HEIC/HEIF images
 	// served by handleImage, keyed on path+mtime — decoding (shelling
@@ -81,6 +87,9 @@ func New() *Server {
 		simStr:    defaultSimilarity,
 		blurStr:   defaultBlur,
 		limitStr:  defaultLimit,
+		fmtJPEG:   true,
+		fmtPNG:    true,
+		fmtHEIC:   true,
 		heicCache: newImageCache(64),
 	}
 
@@ -88,6 +97,7 @@ func New() *Server {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/scan", s.handleScan)
 	mux.HandleFunc("/scan/progress", s.handleScanProgress)
+	mux.HandleFunc("/scan/cancel", s.handleScanCancel)
 	mux.HandleFunc("/browse", s.handleBrowse)
 	mux.HandleFunc("/image", s.handleImage)
 	mux.HandleFunc("/select-winner", s.handleSelectWinner)
@@ -182,6 +192,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		SimStr:      s.simStr,
 		BlurStr:     s.blurStr,
 		LimitStr:    s.limitStr,
+		FormatJPEG:  s.fmtJPEG,
+		FormatPNG:   s.fmtPNG,
+		FormatHEIC:  s.fmtHEIC,
 		BannerText:  s.bannerText,
 		BannerError: s.bannerError,
 		Warnings:    s.warnings,
@@ -235,6 +248,17 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	simStr := formValueOr(r, "similarity", defaultSimilarity)
 	blurStr := formValueOr(r, "blur", defaultBlur)
 	limitStr := formValueOr(r, "limit", defaultLimit)
+	fmtJPEG := r.FormValue("fmt_jpeg") != ""
+	fmtPNG := r.FormValue("fmt_png") != ""
+	fmtHEIC := r.FormValue("fmt_heic") != ""
+	// An unchecked checkbox sends nothing at all, so "none of the three
+	// keys present" is indistinguishable from "every box unchecked" —
+	// treat it the same as every other omitted field here and fall
+	// back to scanning every supported format, rather than rejecting a
+	// scan a browser has no way to submit unambiguously otherwise.
+	if !fmtJPEG && !fmtPNG && !fmtHEIC {
+		fmtJPEG, fmtPNG, fmtHEIC = true, true, true
+	}
 
 	if dir == "" {
 		s.setBanner("choose a directory to scan", true)
@@ -274,6 +298,17 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var extensions []string
+	if fmtJPEG {
+		extensions = append(extensions, ".jpg", ".jpeg")
+	}
+	if fmtPNG {
+		extensions = append(extensions, ".png")
+	}
+	if fmtHEIC {
+		extensions = append(extensions, ".heic", ".heif")
+	}
+
 	s.mu.Lock()
 	if s.scanning {
 		s.mu.Unlock()
@@ -281,11 +316,13 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	s.scanning = true
 	s.scanDirectory = root
 	s.scanCurrent = 0
 	s.scanTotal = 0
 	s.scanPath = ""
+	s.scanCancel = cancel
 	s.bannerText = ""
 	s.bannerError = false
 	s.mu.Unlock()
@@ -302,6 +339,8 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 			SimilarityThreshold: sim,
 			BlurThreshold:       blur,
 			Limit:               limit,
+			Extensions:          extensions,
+			Context:             ctx,
 			Progress: func(current, total int, path string) {
 				s.mu.Lock()
 				s.scanCurrent = current
@@ -311,9 +350,22 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 
+		// cancel is a no-op once the scan has already run to
+		// completion, but calling it unconditionally (rather than only
+		// from handleScanCancel) releases the context's resources
+		// promptly instead of leaving that to the caller who may never
+		// come.
+		cancel()
+
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.scanning = false
+		s.scanCancel = nil
+		if errors.Is(err, context.Canceled) {
+			s.bannerText = fmt.Sprintf("scan of %s cancelled", root)
+			s.bannerError = false
+			return
+		}
 		if err != nil {
 			s.bannerText = fmt.Sprintf("scanning %s: %v", root, err)
 			s.bannerError = true
@@ -330,6 +382,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		s.allowed = allowedPaths(p)
 		s.warnings = warnings
 		s.gapStr, s.simStr, s.blurStr, s.limitStr = gapStr, simStr, blurStr, limitStr
+		s.fmtJPEG, s.fmtPNG, s.fmtHEIC = fmtJPEG, fmtPNG, fmtHEIC
 		s.bannerText = fmt.Sprintf("scanned %s: %d group(s) found", root, len(p.Groups))
 		if skipped := p.Stats.TotalFound - p.Stats.TotalImages; skipped > 0 {
 			s.bannerText += fmt.Sprintf(" (%d image(s) left out by the %d-image limit — raise it to include them)", skipped, limit)
@@ -363,6 +416,23 @@ func (s *Server) handleScanProgress(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleScanCancel stops the scan currently running in the
+// background, if any. It's a no-op (not an error) when nothing is
+// scanning, since a Cancel click racing the scan's own completion is
+// expected, not exceptional.
+func (s *Server) handleScanCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.Lock()
+	if s.scanCancel != nil {
+		s.scanCancel()
+	}
+	s.mu.Unlock()
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func formValueOr(r *http.Request, key, fallback string) string {
@@ -821,6 +891,9 @@ type pageData struct {
 	SimStr            string
 	BlurStr           string
 	LimitStr          string
+	FormatJPEG        bool
+	FormatPNG         bool
+	FormatHEIC        bool
 	BannerText        string
 	BannerError       bool
 	Warnings          []scan.Warning
@@ -974,6 +1047,22 @@ const indexHTML = `<!doctype html>
     margin-bottom: .4rem;
   }
   .field-control { display: flex; gap: .6rem; }
+  .formats-row { display: flex; flex-wrap: wrap; gap: 1.1rem; margin-top: .5rem; }
+  .format-check {
+    display: inline-flex;
+    align-items: center;
+    gap: .45rem;
+    font-family: var(--mono);
+    font-size: .82rem;
+    color: var(--paper-dim);
+    cursor: pointer;
+  }
+  .format-check input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    accent-color: var(--safelight);
+    cursor: pointer;
+  }
   #directory-field {
     flex: 1;
     min-width: 0;
@@ -1190,6 +1279,21 @@ const indexHTML = `<!doctype html>
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .btn-cancel-scan {
+    margin-top: .75rem;
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--paper-dim);
+    border-radius: 7px;
+    padding: .4rem 1rem;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    font-size: .72rem;
+    cursor: pointer;
+    transition: border-color .15s ease, color .15s ease;
+  }
+  .btn-cancel-scan:hover { border-color: var(--safelight); color: var(--safelight); }
 
   .actions { margin-bottom: 1rem; display: flex; gap: .9rem; flex-wrap: wrap; }
   .actions form { display: inline-block; }
@@ -1536,6 +1640,15 @@ const indexHTML = `<!doctype html>
       </div>
     </div>
 
+    <div class="field">
+      <label>Formats</label>
+      <div class="formats-row">
+        <label class="format-check"><input type="checkbox" name="fmt_jpeg" form="scan-form"{{if .FormatJPEG}} checked{{end}}{{if .Scanning}} disabled{{end}}> JPEG</label>
+        <label class="format-check"><input type="checkbox" name="fmt_png" form="scan-form"{{if .FormatPNG}} checked{{end}}{{if .Scanning}} disabled{{end}}> PNG</label>
+        <label class="format-check"><input type="checkbox" name="fmt_heic" form="scan-form"{{if .FormatHEIC}} checked{{end}}{{if .Scanning}} disabled{{end}}> HEIC / HEIF</label>
+      </div>
+    </div>
+
     <div class="dials-row">
       <div class="dial">
         <div class="dial-label-row">
@@ -1622,6 +1735,9 @@ const indexHTML = `<!doctype html>
         <div class="develop-fill indeterminate" id="develop-fill"></div>
       </div>
       <div class="develop-path" id="develop-path"></div>
+      <form method="POST" action="/scan/cancel">
+        <button type="submit" class="btn-cancel-scan">Cancel</button>
+      </form>
     </div>
   </section>
 

@@ -5,6 +5,7 @@
 package scan
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -66,6 +67,23 @@ type Options struct {
 	// (this package doesn't impose one itself) should set it
 	// explicitly.
 	Limit int
+
+	// Extensions restricts discovery to these file extensions
+	// (lowercase, leading dot: ".jpg"). Entries not in this package's
+	// supported set are ignored rather than rejected. Empty or nil
+	// means every supported extension — the default for a caller that
+	// doesn't offer format selection.
+	Extensions []string
+
+	// Context, if non-nil, lets a caller stop a scan already in
+	// progress. Cancellation is cooperative and checked between
+	// files, not mid-decode: once cancelled, no further files start
+	// resolving, but whichever are already in flight still finish.
+	// Run returns ctx.Err() (wrapping context.Canceled) rather than a
+	// partial Plan, since a cancelled scan was explicitly told not to
+	// see the job through. Nil defaults to context.Background(), i.e.
+	// never cancelled.
+	Context context.Context
 }
 
 // Warning records a file that was skipped rather than causing the
@@ -95,7 +113,12 @@ type entry struct {
 func Run(opts Options) (plan.Plan, []Warning, error) {
 	start := time.Now()
 
-	paths, totalFound, err := discover(opts.Root, opts.Limit)
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	paths, totalFound, err := discover(opts.Root, opts.Limit, opts.Extensions)
 
 	if err != nil {
 		return plan.Plan{}, nil, err
@@ -106,7 +129,10 @@ func Run(opts Options) (plan.Plan, []Warning, error) {
 		progress = func(int, int, string) {}
 	}
 
-	entries, warnings := resolveEntries(paths, opts.Concurrency, progress)
+	entries, warnings := resolveEntries(ctx, paths, opts.Concurrency, progress)
+	if err := ctx.Err(); err != nil {
+		return plan.Plan{}, warnings, err
+	}
 
 	var totalSizeBytes int64
 	for _, e := range entries {
@@ -236,8 +262,9 @@ func buildGroup(id int, entries []entry, blurThreshold float64) (g plan.Group, o
 // off. progress is serialized behind the same lock that collects
 // results, so callers see one call per file with a strictly
 // increasing count, same as a sequential scan — just not necessarily
-// in discovery order.
-func resolveEntries(paths []string, concurrency int, progress func(index, total int, path string)) ([]entry, []Warning) {
+// in discovery order. Once ctx is done, no further paths are handed
+// to a worker, but whichever are already in flight still finish.
+func resolveEntries(ctx context.Context, paths []string, concurrency int, progress func(index, total int, path string)) ([]entry, []Warning) {
 	if concurrency <= 0 {
 		concurrency = runtime.NumCPU()
 	}
@@ -300,8 +327,13 @@ func resolveEntries(paths []string, concurrency int, progress func(index, total 
 			}
 		}()
 	}
+feed:
 	for _, path := range paths {
-		jobs <- path
+		select {
+		case jobs <- path:
+		case <-ctx.Done():
+			break feed
+		}
 	}
 	close(jobs)
 	wg.Wait()
@@ -340,15 +372,27 @@ func toFileRecord(c pick.Candidate) (plan.FileRecord, error) {
 	}, nil
 }
 
-// discover returns every supported image file directly inside root,
-// capped at limit (zero or negative means unlimited). The directory
-// is treated as flat: subdirectories (including dedupe-kept/ and
-// dedupe-quarantine/ from a prior apply) are never descended into.
-// total is the number of supported files found before any cap, so a
-// capped caller can report how many were left out; os.ReadDir already
-// returns entries in filename order, so a repeated scan of an
-// unchanged directory always caps to the same subset.
-func discover(root string, limit int) (paths []string, total int, err error) {
+// discover returns every image file directly inside root whose
+// extension is both supported and in extensions (empty extensions
+// means every supported extension), capped at limit (zero or
+// negative means unlimited). The directory is treated as flat:
+// subdirectories (including dedupe-kept/ and dedupe-quarantine/ from
+// a prior apply) are never descended into. total is the number of
+// matching files found before any cap, so a capped caller can report
+// how many were left out; os.ReadDir already returns entries in
+// filename order, so a repeated scan of an unchanged directory always
+// caps to the same subset.
+func discover(root string, limit int, extensions []string) (paths []string, total int, err error) {
+	allowedExt := supportedExt
+	if len(extensions) > 0 {
+		allowedExt = make(map[string]bool, len(extensions))
+		for _, ext := range extensions {
+			if supportedExt[ext] {
+				allowedExt[ext] = true
+			}
+		}
+	}
+
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, 0, err
@@ -359,7 +403,7 @@ func discover(root string, limit int) (paths []string, total int, err error) {
 		if e.IsDir() {
 			continue
 		}
-		if !supportedExt[strings.ToLower(filepath.Ext(e.Name()))] {
+		if !allowedExt[strings.ToLower(filepath.Ext(e.Name()))] {
 			continue
 		}
 		total++

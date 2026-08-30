@@ -1,6 +1,8 @@
 package scan
 
 import (
+	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -235,6 +237,81 @@ func TestRun_LimitZeroIsUnlimited(t *testing.T) {
 	}
 	if p.Stats.TotalFound != 5 || p.Stats.TotalImages != 5 {
 		t.Fatalf("Stats = %+v, want TotalFound=5 TotalImages=5 (no Limit set)", p.Stats)
+	}
+}
+
+func TestRun_ExtensionsFiltersDiscoveredFiles(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	writePNG(t, filepath.Join(root, "a.png"), flat(64), base)
+	heicFixture(t, filepath.Join(root, "b.heic"), flat(64), base.Add(time.Hour))
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9, Extensions: []string{".png"}})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if p.Stats.TotalFound != 1 || p.Stats.TotalImages != 1 {
+		t.Fatalf("Stats = %+v, want TotalFound=1 TotalImages=1 (only .png)", p.Stats)
+	}
+}
+
+func TestRun_ExtensionsEmptyMeansEverySupportedFormat(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	writePNG(t, filepath.Join(root, "a.png"), flat(64), base)
+	heicFixture(t, filepath.Join(root, "b.heic"), flat(64), base.Add(time.Hour))
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if p.Stats.TotalFound != 2 || p.Stats.TotalImages != 2 {
+		t.Fatalf("Stats = %+v, want TotalFound=2 TotalImages=2 (no Extensions set)", p.Stats)
+	}
+}
+
+func TestRun_ExtensionsIgnoresUnsupportedEntries(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	writePNG(t, filepath.Join(root, "a.png"), flat(64), base)
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9, Extensions: []string{".png", ".gif"}})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if p.Stats.TotalFound != 1 || p.Stats.TotalImages != 1 {
+		t.Fatalf("Stats = %+v, want TotalFound=1 TotalImages=1 (unsupported .gif ignored, not treated as unlimited)", p.Stats)
+	}
+}
+
+func TestRun_ContextAlreadyCancelledReturnsCanceledError(t *testing.T) {
+	root := t.TempDir()
+	base := time.Now()
+	for i := 0; i < 5; i++ {
+		writePNG(t, filepath.Join(root, "img"+string(rune('a'+i))+".png"), flat(64), base.Add(time.Duration(i)*time.Hour))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9, Context: ctx})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(p.Groups) != 0 {
+		t.Fatalf("Groups = %+v, want none — a cancelled scan should discard its partial result", p.Groups)
+	}
+}
+
+func TestRun_NilContextDefaultsToUncancelled(t *testing.T) {
+	root := t.TempDir()
+	writePNG(t, filepath.Join(root, "a.png"), flat(64), time.Now())
+
+	// Options.Context left unset (nil) must behave exactly like an
+	// explicit context.Background() — never cancelled.
+	_, _, err := Run(Options{Root: root, GapThreshold: time.Minute, SimilarityThreshold: 8, BlurThreshold: 1e9})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
 }
 
