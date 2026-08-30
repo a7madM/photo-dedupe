@@ -50,7 +50,7 @@ just skipped and logged like any other unreadable file.
 ## Usage
 
 ```
-dedupe scan [-gap 20s] [-similarity 8] [-blur 5e6] [-out path] [-log path] <directory>
+dedupe scan [-gap 20s] [-similarity 8] [-blur 5e6] [-limit 1000] [-out path] [-log path] <directory>
 dedupe apply <plan-file>
 dedupe restore <plan-file>
 dedupe serve [-addr 127.0.0.1:8765]
@@ -63,8 +63,12 @@ dedupe serve [-addr 127.0.0.1:8765]
 | `-gap`        | `20s`                             | Max gap between consecutive shots to stay in the same time-cluster.                          |
 | `-similarity` | `8`                               | Max perceptual-hash Hamming distance to treat two images as the same shot.                   |
 | `-blur`       | `5e6`                             | Sharpness margin below a group's best before a candidate is excluded from winning.            |
+| `-limit`      | `1000`                            | Max images to process in one scan (`0` = unlimited); keeps runtime bounded on very large directories. Files beyond the cap are taken in stable filename order, so a rerun with a higher limit picks up the same subset first. |
 | `-out`        | `<directory>/.dedupe-plan.json`   | Where to write the plan file.                                                                 |
 | `-log`        | *(none)*                          | Also mirror progress lines (`[i/total] path`) to this file. Progress always prints to the terminal regardless of this flag. |
+
+`scan`'s summary reports total library size and space reclaimable (both in
+MB and as a % of the library), alongside images processed and groups found.
 
 `scan` never touches your files — it writes a plan (`.dedupe-plan.json` in the
 scanned directory by default) and prints a summary. Review the plan, then:
