@@ -1,5 +1,7 @@
 # photo·dedupe
 
+![photo·dedupe](docs/thumbnail.png)
+
 A local Go CLI that finds burst-shot duplicates on disk, picks the sharpest
 frame, and quarantines the rest — no cloud, no accounts, nothing leaves the
 machine.
